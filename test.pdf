@@ -1,0 +1,531 @@
+Oui. Pour un **test simple avec `test.csv`**, le plus rationnel est de séparer 3 sujets :
+
+1. **préparer Starburst/Trino pour lire Iceberg**,
+2. **faire tourner le job Spark streaming**,
+3. **vérifier que le traitement a bien eu lieu**.
+
+Je te détaille une procédure simple et cohérente avec l’architecture qu’on a construite :
+
+* une fausse source `test.csv`,
+* Spark Structured Streaming lit cette source,
+* Spark écrit dans une table **Iceberg**,
+* **Starburst** lit cette table,
+* tu vérifies le résultat à la fois côté Spark et côté Starburst.
+
+---
+
+# 1. Ce qu’il faut bien comprendre avant de commencer
+
+Dans ce scénario, **Starburst ne lance pas le job Spark**.
+Son rôle est différent :
+
+* **Spark** fait le calcul et écrit dans Iceberg ;
+* **Starburst** sert uniquement à **requêter** les tables Iceberg produites.
+
+Donc :
+
+* le **job** apparaît côté **Spark**,
+* les **résultats** apparaissent côté **Starburst**.
+
+Autrement dit, pour prouver que le pipeline fonctionne, il faut vérifier deux choses :
+
+### Côté Spark
+
+* le streaming query est démarré ;
+* des micro-batches sont exécutés ;
+* la table Iceberg est alimentée.
+
+### Côté Starburst
+
+* la table Iceberg est visible ;
+* les nouvelles lignes sont lisibles par SQL.
+
+---
+
+# 2. Architecture minimale de test
+
+Pour un PoC local ou semi-local, la chaîne la plus simple est :
+
+```text
+test.csv
+   ↓
+landing folder / input folder
+   ↓
+Spark Structured Streaming
+   ↓
+Iceberg table
+   ↓
+Starburst / Trino
+   ↓
+SQL query / visual check
+```
+
+Dans ce modèle, `test.csv` joue le rôle de la source simulée.
+
+---
+
+# 3. Préparer la fausse source `test.csv`
+
+Tu peux partir sur un CSV très simple, par exemple :
+
+```csv
+id,firstcol,value
+1,A,10
+2,B,20
+3,C,30
+```
+
+Ensuite, il faut décider **comment Spark le lit comme un flux**.
+
+## Important
+
+Spark Structured Streaming **ne “stream” pas un fichier unique qui change en place** de manière idéale.
+Le pattern standard est :
+
+* créer un dossier d’entrée, par exemple `stream_input/`
+* déposer dedans des fichiers CSV au fil du temps
+
+Exemple :
+
+```text
+stream_input/
+  batch_001.csv
+  batch_002.csv
+  batch_003.csv
+```
+
+Pour un test, tu peux :
+
+* mettre `test.csv` dans `stream_input/batch_001.csv`
+* puis copier plus tard d’autres fichiers pour simuler un flux continu
+
+Donc en pratique :
+
+```bash
+mkdir -p stream_input
+cp test.csv stream_input/batch_001.csv
+```
+
+---
+
+# 4. Setup Starburst / Trino pour lire Iceberg
+
+Pour que Starburst voie les données, il doit être configuré avec un **catalog Iceberg** pointant vers le **même warehouse** qu’utilise Spark.
+
+## 4.1 Principe
+
+Spark et Starburst doivent partager :
+
+* le **même stockage** des fichiers Iceberg,
+* le **même catalog** ou la même logique de métadonnées.
+
+Pour un test simple, tu peux utiliser un **Hadoop catalog** avec un warehouse local partagé.
+
+Exemple conceptuel :
+
+* Spark écrit dans : `/data/iceberg_warehouse`
+* Starburst lit ce même chemin via un catalog Iceberg
+
+---
+
+## 4.2 Exemple de configuration Starburst / Trino
+
+Dans le dossier des catalogs de Trino/Starburst, il faut un fichier du type :
+
+### `etc/catalog/iceberg.properties`
+
+```properties
+connector.name=iceberg
+iceberg.catalog.type=hadoop
+iceberg.hadoop.warehouse=/data/iceberg_warehouse
+fs.native-local.enabled=true
+```
+
+Cette config dit à Starburst :
+
+* utilise le connecteur Iceberg,
+* avec un catalog Hadoop,
+* et lis les tables dans `/data/iceberg_warehouse`.
+
+## 4.3 Cas Docker
+
+Si tu lances Trino/Starburst en conteneur, il faut monter le warehouse dans le conteneur :
+
+```bash
+-v /chemin/local/iceberg_warehouse:/data/iceberg_warehouse
+```
+
+Sinon, Starburst ne verra pas les fichiers écrits par Spark.
+
+---
+
+# 5. Setup Spark pour écrire en Iceberg
+
+Spark doit être configuré avec le **même catalog**.
+
+Exemple de session Spark :
+
+```python
+spark = (
+    SparkSession.builder
+    .appName("spark-streaming-to-iceberg")
+    .config("spark.sql.catalog.local", "org.apache.iceberg.spark.SparkCatalog")
+    .config("spark.sql.catalog.local.type", "hadoop")
+    .config("spark.sql.catalog.local.warehouse", "/data/iceberg_warehouse")
+    .getOrCreate()
+)
+```
+
+Ici :
+
+* `local` est le nom du catalog Spark,
+* `/data/iceberg_warehouse` est le warehouse partagé avec Starburst.
+
+---
+
+# 6. Comment écrire le stream à partir de `test.csv`
+
+Le plus propre est de lire le dossier `stream_input/` comme source streaming CSV.
+
+Exemple :
+
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.types import StructType, StructField, StringType
+
+spark = (
+    SparkSession.builder
+    .appName("csv-stream-to-iceberg")
+    .config("spark.sql.catalog.local", "org.apache.iceberg.spark.SparkCatalog")
+    .config("spark.sql.catalog.local.type", "hadoop")
+    .config("spark.sql.catalog.local.warehouse", "/data/iceberg_warehouse")
+    .getOrCreate()
+)
+
+schema = StructType([
+    StructField("id", StringType(), True),
+    StructField("firstcol", StringType(), True),
+    StructField("value", StringType(), True),
+])
+
+# création du namespace/table si besoin
+spark.sql("CREATE NAMESPACE IF NOT EXISTS local.ctdf")
+
+spark.sql("""
+CREATE TABLE IF NOT EXISTS local.ctdf.test_stream_table (
+    id STRING,
+    firstcol STRING,
+    value STRING,
+    unique_key STRING
+)
+USING iceberg
+""")
+
+stream_df = (
+    spark.readStream
+    .option("header", True)
+    .schema(schema)
+    .csv("stream_input")
+)
+
+processed_df = stream_df.withColumn(
+    "unique_key",
+    stream_df["id"].cast("string")
+)
+
+query = (
+    processed_df.writeStream
+    .foreachBatch(lambda df, epoch_id: df.writeTo("local.ctdf.test_stream_table").append())
+    .option("checkpointLocation", "checkpoints/test_stream_table")
+    .start()
+)
+
+query.awaitTermination()
+```
+
+---
+
+# 7. Comment “voir le job apparaître”
+
+Cela dépend de ton mode d’exécution.
+
+---
+
+## 7.1 Si tu lances Spark en local
+
+Le job apparaît dans la **Spark UI**, généralement sur :
+
+```text
+http://localhost:4040
+```
+
+Tu pourras voir :
+
+* les jobs exécutés,
+* les stages,
+* les micro-batches,
+* les tâches,
+* les durations.
+
+Dans Structured Streaming, tu regardes surtout :
+
+* **Jobs**
+* **Stages**
+* **SQL / DataFrame**
+* parfois l’onglet **Streaming** selon version/outils
+
+---
+
+## 7.2 Si tu lances Spark sur Kubernetes / SparkaaS
+
+Le job apparaît :
+
+* dans la **Spark UI** de l’application,
+* dans la liste des **Spark Applications**,
+* éventuellement dans l’interface du Spark Operator,
+* ou via `kubectl get pods` si tu es sur K8s.
+
+Dans ce cas, les éléments à observer sont :
+
+* le **driver pod** est en `Running`,
+* les **executor pods** sont démarrés,
+* les logs ne contiennent pas d’erreur,
+* des micro-batches sont exécutés.
+
+---
+
+## 7.3 Ce que tu dois voir concrètement
+
+Pour dire que le job “apparaît” et tourne bien, il faut observer :
+
+* une application Spark active,
+* au moins un micro-batch traité,
+* des écritures vers Iceberg,
+* pas d’erreur sur le checkpoint ou le catalog.
+
+---
+
+# 8. Comment vérifier que le Spark stream processing a bien fonctionné
+
+Il faut vérifier à plusieurs niveaux.
+
+---
+
+## 8.1 Vérification 1 : logs Spark
+
+Dans les logs, tu dois voir que :
+
+* la query streaming a démarré ;
+* Spark a détecté des fichiers dans `stream_input` ;
+* un micro-batch a été exécuté ;
+* l’écriture vers Iceberg s’est bien passée.
+
+Exemples de signaux positifs :
+
+* démarrage du stream ;
+* batch `0`, `1`, etc. exécutés ;
+* pas d’exception sur `checkpointLocation` ;
+* pas d’erreur sur `writeTo(...).append()`.
+
+---
+
+## 8.2 Vérification 2 : lecture directe via Spark
+
+Tu peux relire la table Iceberg avec Spark :
+
+```python
+df = spark.read.format("iceberg").load("local.ctdf.test_stream_table")
+df.show(truncate=False)
+```
+
+Si tu vois tes lignes, alors :
+
+* le stream a traité les fichiers ;
+* l’écriture Iceberg a réussi.
+
+---
+
+## 8.3 Vérification 3 : requête SQL dans Starburst
+
+C’est la vérification la plus importante côté consommation.
+
+Une fois Starburst démarré et le catalog configuré, tu peux lancer :
+
+```sql
+SHOW CATALOGS;
+```
+
+Puis :
+
+```sql
+SHOW SCHEMAS FROM iceberg;
+```
+
+ou selon le nom du catalog :
+
+```sql
+SHOW SCHEMAS FROM local;
+```
+
+Puis :
+
+```sql
+SHOW TABLES FROM local.ctdf;
+```
+
+Puis :
+
+```sql
+SELECT * FROM local.ctdf.test_stream_table;
+```
+
+Si tu vois les lignes du CSV, cela prouve que :
+
+* Spark a écrit correctement dans Iceberg ;
+* Starburst lit bien la table.
+
+---
+
+## 8.4 Vérification 4 : test de flux continu
+
+Le vrai test streaming consiste à ajouter un nouveau fichier pendant que le job tourne :
+
+```bash
+cp test2.csv stream_input/batch_002.csv
+```
+
+Puis relancer :
+
+```sql
+SELECT * FROM local.ctdf.test_stream_table;
+```
+
+Le nombre de lignes doit augmenter.
+
+C’est la preuve que :
+
+* le stream reste actif ;
+* Spark détecte les nouveaux fichiers ;
+* les données sont ajoutées incrémentalement.
+
+---
+
+# 9. Comment voir que Starburst est “bien setup”
+
+Starburst est correctement configuré si :
+
+1. le serveur démarre sans erreur de catalog ;
+2. le catalog Iceberg apparaît dans `SHOW CATALOGS` ;
+3. le schema est visible ;
+4. la table est visible ;
+5. la requête `SELECT` renvoie les lignes attendues.
+
+---
+
+# 10. Point important : Starburst ne montre pas le “job Spark”
+
+C’est un point qu’il faut bien clarifier.
+
+**Starburst ne montre pas l’exécution du job Spark lui-même.**
+
+Starburst peut montrer :
+
+* les tables disponibles ;
+* les requêtes SQL exécutées ;
+* éventuellement l’historique des requêtes SQL.
+
+Mais le job Spark, lui, se surveille :
+
+* dans la Spark UI,
+* dans les logs Spark,
+* dans Kubernetes/SparkaaS.
+
+Donc :
+
+### Pour vérifier le traitement
+
+* **Spark UI + logs Spark**
+
+### Pour vérifier le résultat
+
+* **requête Starburst**
+
+---
+
+# 11. Procédure de test complète, simple et robuste
+
+Voici la séquence la plus simple pour ton PoC.
+
+## Étape 1
+
+Créer :
+
+* `stream_input/`
+* `checkpoints/`
+* `iceberg_warehouse/`
+
+## Étape 2
+
+Configurer Spark et Starburst avec le même warehouse Iceberg.
+
+## Étape 3
+
+Démarrer Starburst.
+
+## Étape 4
+
+Démarrer le job Spark streaming.
+
+## Étape 5
+
+Copier `test.csv` dans `stream_input/batch_001.csv`.
+
+## Étape 6
+
+Vérifier dans Spark UI qu’un micro-batch a été traité.
+
+## Étape 7
+
+Exécuter dans Starburst :
+
+```sql
+SELECT * FROM local.ctdf.test_stream_table;
+```
+
+## Étape 8
+
+Ajouter un second fichier CSV.
+
+## Étape 9
+
+Relancer la requête SQL et vérifier que de nouvelles lignes apparaissent.
+
+---
+
+# 12. Ce que tu pourras dire à l’oral
+
+Tu peux l’expliquer comme ça :
+
+> Pour tester Spark Streaming sans Kafka, on simule un flux continu en déposant des fichiers CSV dans un dossier surveillé par Spark Structured Streaming. Spark traite chaque nouveau fichier comme un micro-batch, transforme les données, puis les écrit dans une table Iceberg. Starburst ne déclenche pas le job, il sert à lire la table Iceberg produite par Spark. On vérifie donc l’exécution côté Spark UI et le résultat côté Starburst avec une requête SQL.
+
+---
+
+# 13. Recommandation pratique
+
+Pour ton test, je te conseille de ne pas commencer directement avec l’API synchrone.
+Le plus simple est :
+
+1. **test CSV → streaming folder → Iceberg**
+2. **lecture Starburst**
+3. ensuite seulement :
+   **API synchrone → landing files → Spark → Iceberg replies**
+
+Cela isole les problèmes techniques.
+
+---
+
+Si tu veux, je peux maintenant te donner :
+
+* un **docker-compose minimal** pour Spark + Trino + Iceberg local,
+* un **script Python complet prêt à lancer avec `test.csv`**,
+* ou une **checklist de debug** si la table n’apparaît pas dans Starburst.
