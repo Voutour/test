@@ -1,4 +1,3 @@
---conf spark.kubernetes.driverEnv.NO_PROXY="localhost,127.0.0.1,kubernetes.default.svc,kubernetes.default.svc.cluster.local,.appdomain.cloud" \
---conf spark.kubernetes.driverEnv.no_proxy="localhost,127.0.0.1,kubernetes.default.svc,kubernetes.default.svc.cluster.local,.appdomain.cloud" \
---conf spark.hadoop.fs.s3a.attempts.maximum=1 \
---conf spark.hadoop.fs.s3a.connection.timeout=5000 \
+--conf spark.hadoop.fs.s3a.aws.credentials.provider=com.amazonaws.auth.EnvironmentVariableCredentialsProvider \
+  --conf spark.driver.extraJavaOptions="-Dcom.amazonaws.sdk.disableEc2Metadata=true" \
+  --conf spark.executor.extraJavaOptions="-Dcom.amazonaws.sdk.disableEc2Metadata=true" \
