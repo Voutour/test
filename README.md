@@ -1,2 +1,4 @@
---conf spark.kubernetes.driverEnv.NO_PROXY="localhost,127.0.0.1,kubernetes.default.svc,kubernetes.default.svc.cluster.local" \
---conf spark.kubernetes.driverEnv.no_proxy="localhost,127.0.0.1,kubernetes.default.svc,kubernetes.default.svc.cluster.local" \
+--conf spark.kubernetes.driverEnv.NO_PROXY="localhost,127.0.0.1,kubernetes.default.svc,kubernetes.default.svc.cluster.local,.appdomain.cloud" \
+--conf spark.kubernetes.driverEnv.no_proxy="localhost,127.0.0.1,kubernetes.default.svc,kubernetes.default.svc.cluster.local,.appdomain.cloud" \
+--conf spark.hadoop.fs.s3a.attempts.maximum=1 \
+--conf spark.hadoop.fs.s3a.connection.timeout=5000 \
