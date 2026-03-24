@@ -1,0 +1,2 @@
+--conf spark.kubernetes.driverEnv.NO_PROXY="localhost,127.0.0.1,kubernetes.default.svc,kubernetes.default.svc.cluster.local" \
+--conf spark.kubernetes.driverEnv.no_proxy="localhost,127.0.0.1,kubernetes.default.svc,kubernetes.default.svc.cluster.local" \
