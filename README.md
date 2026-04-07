@@ -18,16 +18,15 @@ from pyspark.sql.types import StructType, StructField, StringType, TimestampType
 from pyspark.sql.functions import current_timestamp, to_json, col
 
 # ==========================================
-# 1. CONFIGURATION DES CHEMINS S3
+# 1. CONFIGURATION
 # ==========================================
 RAW_BUCKET_PATH = "s3a://bu002i004226/poc_streaming/input_cloudevent_raw/"
 CHECKPOINT_PATH = "s3a://bu002i004226/poc_streaming/checkpoint_cloudevent/"
-# Le warehouse pointe sur le dossier parent, pour que la table "cloudevent" 
-# corresponde exactement à ton chemin Starburst ".../poc_streaming/cloudevent"
+# Le warehouse s'arrête au dossier parent
 ICEBERG_WAREHOUSE = "s3a://bu002i004226/poc_streaming/" 
 
 # ==========================================
-# 2. INITIALISATION DE LA SESSION SPARK
+# 2. INITIALISATION
 # ==========================================
 print("### INIT SPARK - ARCHITECTURE CLOUDEVENT ###")
 spark = SparkSession.builder \
@@ -41,14 +40,12 @@ spark = SparkSession.builder \
 spark.sparkContext.setLogLevel("WARN")
 
 # ==========================================
-# 3. LE GÉNÉRATEUR DE DONNÉES (MOCK API)
+# 3. GÉNÉRATEUR MOCK (Tourne en fond)
 # ==========================================
 def generate_mock_events():
-    """Génère un fichier JSON CloudEvent toutes les 2s avec un max d'itérations"""
     max_iterations = 20
     sleep_time = 2
     
-    # Schéma pour la génération
     gen_schema = StructType([
         StructField("specversion", StringType(), True),
         StructField("type", StringType(), True),
@@ -65,20 +62,13 @@ def generate_mock_events():
         event_id = str(uuid.uuid4())
         now_iso = datetime.utcnow().isoformat() + "Z"
         
-        # Données avec contenu variable
         mock_data = [(
-            "1.0", 
-            "com.enterprise.sensor", 
-            f"/sensors/device-{i}", 
-            "telemetry", 
-            event_id, 
-            now_iso, 
-            "application/json", 
-            {"temperature": str(20 + i), "status": "OK", "battery": str(100 - i)} # Le payload métier
+            "1.0", "com.enterprise.sensor", f"/sensors/device-{i}", 
+            "telemetry", event_id, now_iso, "application/json", 
+            {"temperature": str(20 + i), "status": "OK", "battery": str(100 - i)}
         )]
         
         df_mock = spark.createDataFrame(mock_data, schema=gen_schema)
-        # Écriture du JSON dans le bucket RAW
         df_mock.write.mode("append").json(RAW_BUCKET_PATH)
         
         print(f"[GÉNÉRATEUR] Événement {i+1}/{max_iterations} écrit ! (ID: {event_id[:8]})")
@@ -86,14 +76,12 @@ def generate_mock_events():
         
     print("[GÉNÉRATEUR] Terminé.\n")
 
-# Lancement du générateur dans un Thread en arrière-plan pour ne pas bloquer le Streaming
 generator_thread = threading.Thread(target=generate_mock_events)
 generator_thread.start()
 
 # ==========================================
-# 4. LE TRAITEMENT SPARK STREAMING
+# 4. LECTURE & TRANSFORMATION
 # ==========================================
-# Le schéma de lecture (On lit 'time' en Timestamp et 'data' en Map)
 read_schema = StructType([
     StructField("specversion", StringType(), True),
     StructField("type", StringType(), True),
@@ -105,28 +93,38 @@ read_schema = StructType([
     StructField("data", MapType(StringType(), StringType()), True) 
 ])
 
-print("### DÉMARRAGE DU STREAMING GET EVENT ###")
-
-# A. Lecture du Bucket RAW
 df_stream = spark.readStream \
     .format("json") \
     .schema(read_schema) \
     .load(RAW_BUCKET_PATH)
 
-# B. Transformation (On transforme 'data' en chaîne JSON texte)
 df_processed = df_stream \
     .withColumn("data", to_json(col("data"))) \
     .withColumn("dh_poc_insert_timestamp", current_timestamp())
 
-print("### ÉCRITURE VERS REFINED DATA STORAGE (ICEBERG) ###")
+# ==========================================
+# 4.5. SÉCURITÉ ANTI-CRASH "TABLE NOT FOUND"
+# ==========================================
+# On force Spark à s'approprier la table avant de lancer le stream
+print("### INITIALISATION DE LA TABLE (SÉCURITÉ) ###")
+empty_df = spark.createDataFrame([], df_processed.schema)
+try:
+    # On utilise "cloudevent" pour correspondre au dossier exact de ta table Starburst
+    empty_df.writeTo("iceberg_cat.cloudevent").createOrReplace()
+    print("[SUCCÈS] Enveloppe de la table validée par Spark.")
+except Exception as e:
+    print(f"[INFO] Initialisation table : {e}")
 
-# C. Écriture vers la table Iceberg configurée dans Starburst
+# ==========================================
+# 5. STREAMING VERS ICEBERG
+# ==========================================
+print("### DÉMARRAGE DU STREAMING VERS ICEBERG ###")
 query = df_processed.writeStream \
     .format("iceberg") \
     .outputMode("append") \
     .trigger(processingTime="2 seconds") \
     .option("checkpointLocation", CHECKPOINT_PATH) \
-    .toTable("iceberg_cat.cloudevent") # Pointe vers ".../poc_streaming/cloudevent"
+    .toTable("iceberg_cat.cloudevent") 
 
 query.awaitTermination()
 ```
