@@ -31,6 +31,7 @@ ICEBERG_WAREHOUSE = "s3a://bu002i004226/poc_streaming/"
 print("### INIT SPARK - ARCHITECTURE CLOUDEVENT ###")
 spark = SparkSession.builder \
     .appName("DevX-CloudEvent-Stream") \
+    .config("spark.jars.packages", "org.apache.iceberg:iceberg-spark-runtime-3.3_2.12:1.3.1,org.apache.hadoop:hadoop-aws:3.3.4") \
     .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
     .config("spark.sql.catalog.iceberg_cat", "org.apache.iceberg.spark.SparkCatalog") \
     .config("spark.sql.catalog.iceberg_cat.type", "hadoop") \
