@@ -135,10 +135,17 @@ query = df_processed.writeStream \
 query.awaitTermination()
 ```
 
-### Ce qui va se passer à l'exécution :
-1. Spark va démarrer et se connecter au bucket d'entrée (`input_raw`).
-2. S'il y a des fichiers JSON, il les prend.
-3. Il va vérifier le dossier `s3a://bu002i004226/pocspark`. Comme tu as tout nettoyé, il va se dire : *"La table n'existe pas, je la crée avec mon catalogue Hadoop"*.
-4. Il va créer le dossier `metadata/` et y écrire les fichiers de données Parquet.
+Voici une explication concise du fonctionnement de ton code et de son alignement avec ton schéma d'architecture.
 
-Une fois que ce job tourne au vert et que tu vois tes fichiers Parquet apparaître dans le dossier `pocspark`, l'architecture est validée côté Spark. Il ne restera plus qu'à enregistrer cette table existante côté Starburst !
+### 1. Comment le code fait du Spark Streaming
+Le streaming dans ce script repose sur l'API **Spark Structured Streaming**. Plutôt que de lire une base de données statique, il traite les données comme un flux infini grâce à trois mécanismes clés :
+* **L'écoute continue (`readStream`)** : Au lieu de charger un dossier une seule fois (mode Batch), Spark surveille activement le dossier S3 `input_cloudevent_raw`. Dès que le générateur mock (ou ta future application métier) y dépose un nouveau fichier JSON, Spark l'ingère instantanément.
+* **Les Micro-batchs (`trigger`)** : Le paramètre `trigger(processingTime="2 seconds")` cadence le flux. Toutes les 2 secondes, Spark prend les nouveaux événements arrivés, les traite, et les écrit dans Iceberg. C'est du "quasi temps réel".
+* **La tolérance aux pannes (`checkpointLocation`)** : Le dossier de checkpoint agit comme un marque-page. Spark y note précisément quels fichiers S3 ont déjà été traités. Si ton pod Kubernetes crashe et redémarre, Spark lit ce "marque-page" et reprend exactement là où il s'était arrêté, sans perdre de données ni créer de doublons.
+
+### 2. Comment le code respecte ton schéma d'architecture
+Ton code est la traduction technique exacte des blocs de ton schéma d'architecture CloudEvent :
+* **RAW Data Storage (Zone brute)** : Tes applications métiers génèrent des CloudEvents qui atterrissent sous forme de fichiers JSON dans ton bucket S3 d'entrée (`input_cloudevent_raw`). C'est ton point de collecte.
+* **Spark Processing (La transformation)** : Le moteur lit ces fichiers en streaming et applique les transformations requises. Il impose le schéma strict CloudEvent, convertit l'objet métier imbriqué `data` en une simple chaîne JSON textuelle (pour éviter les erreurs de typage dans Starburst), et ajoute la colonne de traçabilité `dh_poc_insert_timestamp`.
+* **Refined Data Storage (Zone affinée / Iceberg)** : L'étape `writeStream` pousse ces données nettoyées vers le dossier S3 de destination (`cloudevent/`). En utilisant le `.format("iceberg")` et le catalogue Hadoop, Spark ne fait pas qu'écrire des fichiers Parquet : il gère le journal des transactions (métadonnées) propre à Iceberg.
+* **Data Access (Starburst)** : L'architecture repose sur le découplage du stockage et du calcul. En confiant à Spark la gestion complète des fichiers et des métadonnées Iceberg sur S3, on permet à Starburst de venir simplement "se brancher" sur le dossier en lecture seule pour exécuter les requêtes SQL des utilisateurs finaux.
