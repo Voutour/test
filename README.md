@@ -26,7 +26,7 @@ CHECKPOINT_PATH = "s3a://bu002i004226/poc_streaming/checkpoint_cloudevent/"
 ICEBERG_WAREHOUSE = "s3a://bu002i004226/poc_streaming/" 
 
 # ==========================================
-# 2. INITIALISATION
+# 2. INITIALISATION DE LA SESSION SPARK
 # ==========================================
 print("### INIT SPARK - ARCHITECTURE CLOUDEVENT ###")
 spark = SparkSession.builder \
@@ -35,6 +35,11 @@ spark = SparkSession.builder \
     .config("spark.sql.catalog.iceberg_cat", "org.apache.iceberg.spark.SparkCatalog") \
     .config("spark.sql.catalog.iceberg_cat.type", "hadoop") \
     .config("spark.sql.catalog.iceberg_cat.warehouse", ICEBERG_WAREHOUSE) \
+    # --- Configurations S3A (Authentification) ---
+    .config("spark.hadoop.fs.s3a.access.key", "TON_ACCESS_KEY_ICI") \
+    .config("spark.hadoop.fs.s3a.secret.key", "TON_SECRET_KEY_ICI") \
+    .config("spark.hadoop.fs.s3a.endpoint", "https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud") \
+    .config("spark.hadoop.fs.s3a.path.style.access", "true") \
     .getOrCreate()
 
 spark.sparkContext.setLogLevel("WARN")
