@@ -131,3 +131,65 @@ WITH (
 ```
 
 Désormais, tout fonctionnera : Spark écrira les Parquets, et Starburst les lira directement. Tu as brillamment identifié la cause racine avec ce document !
+
+
+
+
+
+
+
+C'est une excellente question. Pour gérer un flux massif d'événements de manière simultanée (parallélisme), il ne s'agit plus seulement du code Python, mais de la manière dont Spark distribue le travail sur ton cluster Kubernetes.
+
+Voici comment gérer le parallélisme, optimiser les appels API et visualiser le tout.
+
+### 1. Le parallélisme dans Spark Streaming
+Dans Spark, le parallélisme repose sur trois piliers :
+* **Les Partitions :** C'est l'unité de base. Si tu as 10 partitions dans tes données, Spark peut théoriquement faire travailler 10 processeurs en même temps.
+* **Les Exécuteurs et Cores :** Dans ton fichier `submit_streaming.sh`, tu définis le nombre d'exécuteurs (`--num-executors`) et de cœurs par exécuteur (`--executor-cores`).
+* **Le "Shuffle" :** Pour répartir les données uniformément avant un traitement lourd, on utilise souvent `.repartition(n)`.
+
+### 2. Optimiser l'appel par API (MapPartitions)
+Si ton code doit appeler une API pour chaque événement, faire un appel un par un est très lent (latence réseau). La solution est d'ouvrir **une seule connexion par partition** plutôt que par ligne.
+
+```python
+def call_api_batch(partition):
+    # On crée une session HTTP une seule fois pour toute la partition (ex: 1000 lignes)
+    import requests
+    with requests.Session() as session:
+        results = []
+        for row in partition:
+            # Appel API simulé
+            # response = session.post(url, json=row.asDict())
+            results.append(row) 
+        return iter(results)
+
+# Dans ton stream :
+df_parallel = df_processed.repartition(10) # On force 10 tâches parallèles
+df_enriched = df_parallel.rdd.mapPartitions(call_api_batch).toDF()
+```
+
+### 3. Visualisation dans la Spark UI
+Pour "voir" le parallélisme, tu dois te connecter à la **Spark UI** (souvent sur le port 4040). 
+* Dans l'onglet **Streaming**, tu verras le temps de traitement des batchs.
+* Dans l'onglet **Stages**, tu verras un graphique (Timeline) montrant toutes les tâches s'exécutant horizontalement. Si elles se chevauchent, c'est que le parallélisme fonctionne.
+
+
+
+Pour t'aider à comprendre comment la configuration de ton cluster influence la vitesse de traitement lors d'une arrivée massive d'événements, voici un simulateur de parallélisme Spark.
+
+```json?chameleon
+{"component":"LlmGeneratedComponent","props":{"height":"700px","prompt":"Simulateur de parallélisme Spark Streaming. Objectif : Visualiser comment le nombre d'exécuteurs et de cœurs gère une charge d'événements API. \n\nEntrées : \n- 'Nombre d'événements entrants' (Slider 100 à 2000).\n- 'Nombre d'exécuteurs' (Slider 1 à 10).\n- 'Cœurs par exécuteur' (Slider 1 à 8).\n- 'Latence API par événement' (ms).\n\nComportement : \n- Lorsqu'on clique sur 'Lancer le Batch', simuler la distribution des événements sur les cœurs disponibles.\n- Afficher un graphique de type 'Timeline' (Gantt chart) montrant les tâches s'exécutant en parallèle sur les différents exécuteurs.\n- Calculer et afficher le 'Temps total de traitement' vs 'Temps théorique sans parallélisme'.\n- Si le nombre d'événements dépasse la capacité immédiate, montrer la mise en file d'attente (Batch Queue).\n\nStyle : Utiliser une esthétique proche de la Spark UI (bleu/gris). Langue : Français.","id":"im_48f4d85f073df021"}}
+```
+
+### Comment tester concrètement ?
+Pour tester et voir les graphes de la Spark UI saturés, tu peux modifier ton générateur pour envoyer un "burst" de données :
+
+1.  **Augmente le nombre de partitions** juste après la lecture : `df.repartition(20)`.
+2.  **Modifie le script de lancement** (`.sh`) pour demander plus de ressources :
+    ```bash
+    --conf spark.executor.instances=5 \
+    --conf spark.executor.cores=4 \
+    ```
+3.  **Simule une charge lourde** dans ton code Python en augmentant le nombre d'itérations du générateur à 2000 au lieu de 20.
+
+En ouvrant la Spark UI pendant le run, tu verras les 20 cœurs (5 instances * 4 cœurs) s'allumer simultanément dans la "Event Timeline". Est-ce que tu veux que je te donne le bloc de code spécifique pour intégrer le `repartition` et l'optimisation `mapPartitions` dans ton script actuel ?
