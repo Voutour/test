@@ -245,3 +245,83 @@ spark-submit \
 ```
 
 Sais-tu déjà quel est le `nom_du_secret_vault` créé par tes administrateurs sur ton namespace Kubernetes pour accéder à S3, ou as-tu besoin de voir avec eux comment ce secret est nommé sur ton environnement ?
+
+C'est une trouvaille **en or massif** ! 🥇
+
+Cette capture d'écran de votre documentation Confluence (CTDF) explique absolument tout. Elle confirme à 100 % le diagnostic du "Cerveau Divisé" (Split-Brain) que nous avions, et surtout, elle nous donne **la solution officielle validée par ton entreprise pour les PoC**.
+
+Voici exactement ce que nous apprend cette documentation et comment on va l'appliquer immédiatement.
+
+### Le verdict de la documentation d'entreprise
+
+1. **Le diagnostic est confirmé :** La ligne *"Spark ne peut pas mettre à jour le catalogue HMS de Starburst en écrivant directement dans le COS"* explique parfaitement pourquoi tes données étaient invisibles dans Starburst tout à l'heure.
+2. **Le blocage est intentionnel :** Le document précise bien que se connecter au Hive Metastore (HMS) de Starburst *"n'est pas possible avec la Sandbox"*. C'est pour cela que tu n'as pas l'URL et que ça bloquait.
+3. **LA SOLUTION (La dernière phrase) :** Tes architectes ont prévu le coup pour les PoC. Regarde la toute dernière ligne : *"Il faudrait donc [...] écrire les fichiers parquet directement dans le COS qui seront consultables via le connecteur Hive dans table associée sur Starburst."*
+
+**En clair :** Pour que ton PoC fonctionne dans cet environnement Sandbox restreint, on doit abandonner le format complexe "Iceberg" dans Spark, et simplement écrire des fichiers **Parquet standards**. Starburst n'aura aucun mal à les lire !
+
+---
+
+### Le Plan d'Action Final (La méthode validée par ton IT)
+
+Nous allons modifier très légèrement l'architecture pour respecter la règle de ta documentation : Spark écrit du Parquet pur, et Starburst le lit.
+
+#### Étape 1 : Nettoyage sur S3
+Comme d'habitude, on repart sur une base saine. Supprime les dossiers `checkpoint_cloudevent` et `cloudevent` de ton bucket S3.
+
+#### Étape 2 : Modification du code Python (On passe au Parquet)
+Ouvre ton fichier `main_cloudevent.py`. Nous allons retirer la surcouche Iceberg de l'écriture.
+Remplace la section **5. STREAMING VERS ICEBERG** par celle-ci (qui écrit en mode Parquet standard) :
+
+```python
+# ==========================================
+# 5. STREAMING VERS S3 (MODE PARQUET STANDARD)
+# ==========================================
+print("### DÉMARRAGE DU STREAMING VERS S3 (PARQUET) ###")
+
+# On définit le chemin de sortie final
+OUTPUT_PATH = "s3a://bu002i004226/poc_streaming/cloudevent_parquet/"
+
+query = df_processed.writeStream \
+    .format("parquet") \
+    .outputMode("append") \
+    .trigger(processingTime="2 seconds") \
+    .option("checkpointLocation", CHECKPOINT_PATH) \
+    .option("path", OUTPUT_PATH) \
+    .start() # On utilise .start() au lieu de .toTable()
+
+query.awaitTermination()
+```
+*(Tu peux même retirer les configurations `iceberg_cat` tout en haut du fichier dans le builder Spark, elles ne sont plus nécessaires, ce qui va alléger ton code !)*
+
+#### Étape 3 : Lancer le Job
+Lance ton script via ton bash habituel : `bash submit_streaming.sh`. Le job va créer le dossier `cloudevent_parquet` et commencer à le remplir avec des fichiers `.parquet`.
+
+#### Étape 4 : La requête finale dans Starburst
+Maintenant que les fichiers sont de simples Parquet, on crée une table externe "classique" (non-Iceberg) dans Starburst. 
+Lance ceci dans Starburst :
+
+```sql
+DROP TABLE IF EXISTS dh_poc_ice.pocspark.cloudevent_raw;
+
+CREATE TABLE dh_poc_ice.pocspark.cloudevent_raw (
+    specversion VARCHAR,
+    type VARCHAR,
+    source VARCHAR,
+    subject VARCHAR,
+    id VARCHAR,
+    time VARCHAR,
+    datacontenttype VARCHAR,
+    data VARCHAR,
+    dh_poc_insert_timestamp TIMESTAMP(6) WITH TIME ZONE
+)
+WITH (
+    format = 'PARQUET',
+    external_location = 's3a://bu002i004226/poc_streaming/cloudevent_parquet/'
+);
+```
+
+*(Note : J'ai remis `time` en `VARCHAR` comme on l'avait corrigé tout à l'heure).*
+
+**Et c'est tout !**
+Tu pourras faire ton `SELECT * FROM dh_poc_ice.pocspark.cloudevent_raw` et voir les données se rafraîchir en direct. Cette doc nous a sauvé la mise en évitant de s'acharner sur une fonctionnalité (Iceberg Sandbox) qui était techniquement bloquée par ton entreprise.
