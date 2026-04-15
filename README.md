@@ -1,9 +1,15 @@
-Voici le code complet et définitif. J'ai revu l'ensemble du script pour m'assurer qu'il n'y ait aucune variable manquante (j'ai notamment corrigé un oubli sur `gen_schema` dans le générateur concurrent) et j'ai structuré le faux flux de données pour qu'il envoie des "vagues" régulières, ce qui te permettra de bien voir la concurrence en action.
+C'est le plan de bataille final. Voici l'ensemble du code et des instructions, nettoyés de toutes les erreurs précédentes (notamment le problème de dossier inexistant et les conflits de types de données).
 
-Ce package final contient la version **Spark (Python)** et la version **Starburst (SQL)** avec toute la traçabilité des horodatages (Observabilité).
+### **L'Architecture Cible**
+1.  **Spark** : Dépose des fichiers Parquet bruts dans `cloudevent_landing/`.
+2.  **Catalog `dh_poc_pde_s3` (Hive)** : Sert de fenêtre pour voir ces fichiers.
+3.  **Catalog `dh_poc_ice` (Iceberg)** : Reçoit les données finales avec tous les calculs de temps.
 
-### 1. Le script Spark complet (`main_cloudevent.py`)
-Avant de lancer ce code, pense bien à vider tes dossiers sur S3 (`input_cloudevent_raw`, `checkpoint_cloudevent`, `cloudevent_landing`) pour partir sur une base totalement propre.
+---
+
+### **Étape 1 : Le Code Spark Complet (`main_cloudevent.py`)**
+
+Ce code inclut le **correctif de 5 secondes** pour éviter le crash au démarrage et les **3 premiers horodatages**.
 
 ```python
 import threading
@@ -14,83 +20,52 @@ from pyspark.sql import SparkSession
 from pyspark.sql.types import StructType, StructField, StringType, MapType
 from pyspark.sql.functions import current_timestamp, to_json, col
 
-# ==========================================
-# CONSTANTES & CHEMINS S3
-# ==========================================
+# CONFIGURATION S3
 S3_ENDPOINT = "https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud"
-RAW_BUCKET_PATH = "s3a://bu002i004226/poc_streaming/input_cloudevent_raw/"
-CHECKPOINT_PATH = "s3a://bu002i004226/poc_streaming/checkpoint_cloudevent/"
-PARQUET_OUTPUT_PATH = "s3a://bu002i004226/poc_streaming/cloudevent_landing/"
+RAW_PATH = "s3a://bu002i004226/poc_streaming/input_cloudevent_raw/"
+CHECKPOINT = "s3a://bu002i004226/poc_streaming/checkpoint_cloudevent/"
+LANDING_PATH = "s3a://bu002i004226/poc_streaming/cloudevent_landing/"
 
-# ==========================================
-# 1. INIT SPARK (Optimisé pour la concurrence)
-# ==========================================
-print("### INIT SPARK - STREAMING PARQUET (CONCURRENT) ###")
+# 1. INITIALISATION SPARK
 spark = SparkSession.builder \
-    .appName("DevX-CloudEvent-Stream-Concurrent") \
+    .appName("DevX-CloudEvent-Final") \
     .config("spark.hadoop.fs.s3a.endpoint", S3_ENDPOINT) \
     .config("spark.hadoop.fs.s3a.path.style.access", "true") \
-    .config("spark.default.parallelism", "10") \
     .config("spark.sql.shuffle.partitions", "10") \
     .getOrCreate()
-
 spark.sparkContext.setLogLevel("WARN")
 
-# ==========================================
-# 2. GÉNÉRATEUR MOCK (Tempêtes de données)
-# ==========================================
-def generate_storm_events():
-    # Configuration du test de charge : 5 vagues de 50 événements
-    max_batches = 5
-    events_per_batch = 50
-    sleep_between_batches = 5 
-    
+# 2. GÉNÉRATEUR CONCURRENT (THREAD)
+def generate_events():
     gen_schema = StructType([
         StructField("specversion", StringType(), True),
         StructField("type", StringType(), True),
         StructField("source", StringType(), True),
         StructField("subject", StringType(), True),
         StructField("id", StringType(), True),
-        StructField("time", StringType(), True), # 1. Timestamp Origine
+        StructField("time", StringType(), True), # T1: Origine
         StructField("datacontenttype", StringType(), True),
         StructField("data", MapType(StringType(), StringType()), True),
-        StructField("dh_poc_gen_timestamp", StringType(), True) # 2. Timestamp Écriture S3
+        StructField("dh_poc_gen_timestamp", StringType(), True) # T2: Écriture S3
     ])
-
-    print(f"\n[GÉNÉRATEUR] Démarrage... {max_batches} vagues prévues.")
     
-    for batch in range(max_batches):
+    while True: # Génération continue par vagues
         mock_data = []
-        print(f"[GÉNÉRATEUR] --- Vague {batch + 1}/{max_batches} en cours d'écriture ---")
+        for i in range(20):
+            now = datetime.utcnow().isoformat() + "Z"
+            mock_data.append(("1.0", "sensor", "dev", "telemetry", str(uuid.uuid4()), now, "json", {"t": "20"}, now))
         
-        for i in range(events_per_batch):
-            event_id = str(uuid.uuid4())
-            time_origin = datetime.utcnow().isoformat() + "Z"
-            time_written = datetime.utcnow().isoformat() + "Z"
-            
-            mock_data.append((
-                "1.0", 
-                "com.sensor", 
-                f"/device-{i}", 
-                "telemetry", 
-                event_id, 
-                time_origin, 
-                "application/json", 
-                {"temp": str(20 + i)}, 
-                time_written
-            ))
-        
-        df_storm = spark.createDataFrame(mock_data, schema=gen_schema)
-        # .repartition(4) force Spark à écrire 4 fichiers en parallèle sur S3 par vague
-        df_storm.repartition(4).write.mode("append").json(RAW_BUCKET_PATH)
-        time.sleep(sleep_between_batches)
+        df = spark.createDataFrame(mock_data, schema=gen_schema)
+        df.repartition(2).write.mode("append").json(RAW_PATH)
+        time.sleep(10)
 
-# Lancement du générateur en arrière-plan
-threading.Thread(target=generate_storm_events).start()
+threading.Thread(target=generate_events, daemon=True).start()
 
-# ==========================================
-# 3. LECTURE STREAMING & TRANSFORMATION
-# ==========================================
+# CORRECTIF : On attend que le premier fichier soit écrit pour créer le dossier
+print("Attente de l'initialisation du dossier S3...")
+time.sleep(10)
+
+# 3. STREAMING
 read_schema = StructType([
     StructField("specversion", StringType(), True),
     StructField("type", StringType(), True),
@@ -103,27 +78,19 @@ read_schema = StructType([
     StructField("dh_poc_gen_timestamp", StringType(), True)
 ])
 
-df_stream = spark.readStream \
-    .format("json") \
-    .schema(read_schema) \
-    .load(RAW_BUCKET_PATH)
+df_stream = spark.readStream.format("json").schema(read_schema).load(RAW_PATH)
 
-# Ajout du timestamp de lecture par Spark (3. Détection par le listener)
+# T3: Lecture Spark
 df_processed = df_stream \
     .withColumn("data", to_json(col("data"))) \
     .withColumn("dh_poc_spark_read_timestamp", current_timestamp())
 
-# ==========================================
-# 4. ÉCRITURE STREAMING (VERS PARQUET LANDING)
-# ==========================================
-print("### DÉMARRAGE DU STREAMING VERS PARQUET SUR S3 ###")
+# ÉCRITURE LANDING
 query = df_processed.writeStream \
     .format("parquet") \
-    .outputMode("append") \
-    .trigger(processingTime="2 seconds") \
-    .option("maxFilesPerTrigger", 200) \
-    .option("checkpointLocation", CHECKPOINT_PATH) \
-    .option("path", PARQUET_OUTPUT_PATH) \
+    .trigger(processingTime="5 seconds") \
+    .option("checkpointLocation", CHECKPOINT) \
+    .option("path", LANDING_PATH) \
     .start()
 
 query.awaitTermination()
@@ -131,14 +98,16 @@ query.awaitTermination()
 
 ---
 
-### 2. Les requêtes Starburst (SQL)
-Pendant que ton job Spark tourne et remplit le dossier "Landing", ouvre ton éditeur Starburst et exécute ces trois requêtes à la suite.
+### **Étape 2 : Les Commandes Starburst (SQL)**
 
-**A. Création de la table de transit (Celle qui lit le Parquet brut)**
+Exécute ces requêtes dans l'ordre pour configurer tes deux catalogues.
+
+#### **1. Créer la table Passerelle (Hive / `dh_poc_pde_s3`)**
+Ici, on met tout en `VARCHAR` pour éviter les erreurs de formatage Hive.
 ```sql
-DROP TABLE IF EXISTS dh_poc_hive.pocspark.cloudevent_landing;
+DROP TABLE IF EXISTS dh_poc_pde_s3.pocspark.cloudevent_landing;
 
-CREATE TABLE dh_poc_hive.pocspark.cloudevent_landing (
+CREATE TABLE dh_poc_pde_s3.pocspark.cloudevent_landing (
     specversion VARCHAR,
     type VARCHAR,
     source VARCHAR,
@@ -148,7 +117,7 @@ CREATE TABLE dh_poc_hive.pocspark.cloudevent_landing (
     datacontenttype VARCHAR,
     data VARCHAR,
     dh_poc_gen_timestamp VARCHAR,
-    dh_poc_spark_read_timestamp TIMESTAMP(6) WITH TIME ZONE
+    dh_poc_spark_read_timestamp VARCHAR
 )
 WITH (
     format = 'PARQUET',
@@ -156,7 +125,8 @@ WITH (
 );
 ```
 
-**B. Création de la table officielle (Iceberg)**
+#### **2. Créer la table Officielle (Iceberg / `dh_poc_ice`)**
+C'est la table finale proprement typée.
 ```sql
 DROP TABLE IF EXISTS dh_poc_ice.pocspark.cloudevent_raw;
 
@@ -178,23 +148,27 @@ WITH (
 );
 ```
 
-**C. L'alimentation finale (Avec la Sysdate Starburst)**
-Dès que tu lances cette requête, Starburst va aspirer toutes les données générées par Spark et y apposer son tampon de date d'intégration.
+#### **3. Alimenter Iceberg depuis Hive**
+C'est ici qu'on ajoute le **T4** (Insertion Starburst).
 ```sql
 INSERT INTO dh_poc_ice.pocspark.cloudevent_raw
 SELECT 
-    specversion,
-    type,
-    source,
-    subject,
-    id,
-    time,
-    datacontenttype,
-    data,
-    dh_poc_gen_timestamp,
-    dh_poc_spark_read_timestamp,
+    specversion, type, source, subject, id, time, datacontenttype, data, dh_poc_gen_timestamp,
+    CAST(dh_poc_spark_read_timestamp AS TIMESTAMP(6) WITH TIME ZONE),
     current_timestamp AS dh_poc_starburst_insert_timestamp
-FROM dh_poc_hive.pocspark.cloudevent_landing;
+FROM dh_poc_pde_s3.pocspark.cloudevent_landing;
 ```
 
-Dès que ce dernier bloc est validé, il ne te restera plus qu'à faire un `SELECT * FROM dh_poc_ice.pocspark.cloudevent_raw;` pour contempler ton travail, tes données concurrentes et tes 4 horodatages de traçabilité !
+---
+
+### **Analyse de la Traçabilité (Observabilité)**
+
+Pour comprendre pourquoi nous faisons tout cela, voici une visualisation de la façon dont les données voyagent et comment la latence est mesurée à chaque étape du pipeline.
+
+[Image d'un pipeline de données streaming montrant les étapes de traitement et les points de mesure de latence]
+
+```json?chameleon
+{"component":"LlmGeneratedComponent","props":{"height":"700px","prompt":"Objectif : Simuler le flux de données et la latence entre Spark, S3, Starburst Hive et Starburst Iceberg. Valeurs initiales : intervalle_spark: 5, delai_s3: 2, frequence_starburst: 10. Stratégie : Standard Layout. Entrées : Curseur pour 'Vitesse Flux Spark (sec)', 'Délai écriture S3 (sec)', 'Délai insertion Iceberg (sec)'. Comportement : Afficher un schéma de flux horizontal (Générateur -> Spark -> S3 -> Hive Gateway -> Iceberg Final). Chaque étape affiche le timestamp généré (T1, T2, T3, T4). Calculer la latence totale cumulée. Montrer visuellement les paquets de données qui progressent. Afficher un tableau comparatif des 4 horodatages pour voir le décalage temporel. Utiliser des termes fonctionnels comme 'accent' pour mettre en évidence l'étape active. Langue : Français.","id":"im_b74644dff766607b"}}
+```
+
+Dès que tu lances le `INSERT INTO` final, ta table Iceberg `dh_poc_ice.pocspark.cloudevent_raw` contiendra l'historique complet. Tu pourras alors calculer tes KPIs de performance réelle !
