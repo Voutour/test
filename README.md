@@ -299,3 +299,123 @@ ORDER BY h.committed_at DESC;
 ```
 
 Si cette configuration échoue avec un `Access Denied`, cela confirme que la Sandbox interdit à Spark d'écrire dans le Metastore. Dans ce cas, la solution "Directe" est physiquement impossible pour des raisons de sécurité bancaire, et non pour des raisons de code. Mais techniquement, c'est **le** standard que tu dois viser.
+
+
+
+
+
+
+C'est une excellente initiative pour ta présentation de PoC ! Montrer l'Event Timeline du Spark UI avec des tâches qui s'exécutent en parallèle est la meilleure preuve visuelle que ton architecture est scalable.
+
+Le problème avec ton code actuel, c'est que **20 événements toutes les 10 secondes, c'est microscopique pour Spark**. Il va traiter ça en une fraction de seconde avec un seul cœur (une seule tâche). Sur la timeline, tu ne verras qu'un minuscule point vert, sans aucune concurrence.
+
+Pour avoir une Event Timeline impressionnante avec de beaux graphiques de faible latence, nous devons faire 3 choses :
+1.  **Créer une "tempête" de fichiers :** Générer beaucoup plus d'événements et les forcer à s'écrire dans plusieurs fichiers simultanément (ex: 10 fichiers). Spark assignera **1 tâche parallèle par fichier lu**.
+2.  **Réduire le Trigger :** Passer de 5 secondes à 1 ou 2 secondes pour montrer que le système réagit au quart de tour (faible latence).
+3.  **Nommer la Query :** Pour que ça apparaisse proprement dans les onglets du Spark UI.
+
+Voici ton code optimisé "Spécial Démo Spark UI". J'ai commenté les zones modifiées avec `--- MODIFIÉ POUR LA DÉMO ---`.
+
+```python
+import threading
+import time
+import uuid
+from datetime import datetime
+from pyspark.sql import SparkSession
+from pyspark.sql.types import StructType, StructField, StringType, MapType
+from pyspark.sql.functions import current_timestamp, to_json, col
+
+# CONFIGURATION S3
+S3_ENDPOINT = "https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud"
+RAW_PATH = "s3a://bu002i004226/poc_streaming/input_cloudevent_raw/"
+CHECKPOINT = "s3a://bu002i004226/poc_streaming/checkpoint_cloudevent/"
+LANDING_PATH = "s3a://bu002i004226/poc_streaming/cloudevent_landing/"
+
+# 1. INITIALISATION SPARK
+spark = SparkSession.builder \
+    .appName("DevX-CloudEvent-Final") \
+    .config("spark.hadoop.fs.s3a.endpoint", S3_ENDPOINT) \
+    .config("spark.hadoop.fs.s3a.path.style.access", "true") \
+    .config("spark.default.parallelism", "20")   # --- MODIFIÉ : Force Spark à utiliser plus de cœurs
+    .config("spark.sql.shuffle.partitions", "20") # --- MODIFIÉ : Améliore le parallélisme des transformations
+    .getOrCreate()
+spark.sparkContext.setLogLevel("WARN")
+
+# 2. GÉNÉRATEUR CONCURRENT (THREAD)
+def generate_events():
+    gen_schema = StructType([
+        StructField("specversion", StringType(), True),
+        StructField("type", StringType(), True),
+        StructField("source", StringType(), True),
+        StructField("subject", StringType(), True),
+        StructField("id", StringType(), True),
+        StructField("time", StringType(), True), # T1: Origine
+        StructField("datacontenttype", StringType(), True),
+        StructField("data", MapType(StringType(), StringType()), True),
+        StructField("dh_poc_gen_timestamp", StringType(), True) # T2: Écriture S3
+    ])
+    
+    while True: # Génération continue par vagues
+        mock_data = []
+        # --- MODIFIÉ : On passe de 20 à 1000 événements par vague pour créer de la charge
+        for i in range(1000): 
+            now = datetime.utcnow().isoformat() + "Z"
+            mock_data.append(("1.0", "sensor", f"dev-{i}", "telemetry", str(uuid.uuid4()), now, "json", {"t": "20"}, now))
+        
+        df = spark.createDataFrame(mock_data, schema=gen_schema)
+        
+        # --- MODIFIÉ : .repartition(10) force l'écriture de 10 fichiers JSON simultanément. 
+        # C'est ÇA qui va créer les 10 barres parallèles dans le Spark UI !
+        df.repartition(10).write.mode("append").json(RAW_PATH)
+        
+        # --- MODIFIÉ : On réduit la pause pour avoir un flux plus tendu
+        time.sleep(2) 
+
+threading.Thread(target=generate_events, daemon=True).start()
+
+print("Attente de l'initialisation du dossier S3...")
+time.sleep(10)
+
+# 3. STREAMING
+read_schema = StructType([
+    StructField("specversion", StringType(), True),
+    StructField("type", StringType(), True),
+    StructField("source", StringType(), True),
+    StructField("subject", StringType(), True),
+    StructField("id", StringType(), True),
+    StructField("time", StringType(), True),
+    StructField("datacontenttype", StringType(), True),
+    StructField("data", MapType(StringType(), StringType()), True),
+    StructField("dh_poc_gen_timestamp", StringType(), True)
+])
+
+df_stream = spark.readStream.format("json").schema(read_schema).load(RAW_PATH)
+
+# T3: Lecture Spark
+df_processed = df_stream \
+    .withColumn("data", to_json(col("data"))) \
+    .withColumn("dh_poc_spark_read_timestamp", current_timestamp())
+
+# ÉCRITURE LANDING
+query = df_processed.writeStream \
+    .queryName("CloudEvent_Landing_Stream") \ # --- MODIFIÉ : Donne un nom propre dans le Spark UI
+    .format("parquet") \
+    .trigger(processingTime="1 seconds") \ # --- MODIFIÉ : Trigger ultra-rapide pour démontrer la faible latence
+    .option("maxFilesPerTrigger", 50) \ # --- MODIFIÉ : Force Spark à avaler plusieurs fichiers d'un coup
+    .option("checkpointLocation", CHECKPOINT) \
+    .option("path", LANDING_PATH) \
+    .start()
+
+query.awaitTermination()
+```
+
+### Ce que tu dois montrer lors de ta démo dans le Spark UI :
+
+1.  **Pour la Latence (Onglet "Structured Streaming") :**
+    * Va dans l'onglet **Structured Streaming**.
+    * Clique sur ton job (`CloudEvent_Landing_Stream`).
+    * Tu verras des graphiques magnifiques : *Input Rate* vs *Process Rate*, et surtout le graphique **Batch Duration**. Avec le trigger à 1 seconde, tu pourras montrer que chaque micro-batch est traité en quelques dizaines ou centaines de millisecondes (faible latence confirmée).
+2.  **Pour la Concurrence (Onglet "Stages" -> "Event Timeline") :**
+    * Va dans l'onglet **Stages** ou **Jobs** et clique sur un Job récent.
+    * Déploie le menu **Event Timeline**.
+    * Grâce au `repartition(10)` du générateur, tu verras les blocs d'exécution verts (les *Tasks*) s'empiler verticalement les uns au-dessus des autres sur la même seconde. Cela prouve visuellement à ton audience que ton code lit et traite 10 fichiers en parallèle simultanément sur les différents cœurs du cluster !
