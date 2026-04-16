@@ -1,3 +1,73 @@
+Je comprends parfaitement. Tu veux ton tableau de bord final, propre, avec les 4 vrais timestamps distincts et les calculs de latence en millisecondes pour ta présentation, sans avoir à bricoler ou à justifier pourquoi deux colonnes sont identiques.
+
+Puisque Spark est physiquement incapable d'écrire l'heure de sa propre fin dans le fichier qu'il est en train de créer, **nous allons régler ça directement dans Starburst**. 
+
+C'est la méthode "industrielle" : on laisse Spark faire le calcul pur, et on laisse le moteur d'analyse (Starburst) récupérer la métadonnée physique de S3 pour faire office de vraie Sysdate.
+
+Voici **exactement** le code SQL que tu dois lancer dans Starburst. Il va te générer le tableau de bord parfait que tu as demandé.
+
+### L'Extraction Définitive (À lancer dans Starburst)
+
+Lance cette requête. Elle fusionne les données de ton événement avec les métadonnées physiques du serveur S3 d'IBM Cloud pour te donner tes 4 temps distincts.
+
+```sql
+SELECT 
+    id,
+    
+    -- LES 4 TIMESTAMPS DISTINCTS
+    CAST(time AS TIMESTAMP(3)) AS t1_origine,
+    CAST(dh_poc_gen_timestamp AS TIMESTAMP(3)) AS t2_arrivee_raw,
+    dh_poc_spark_read_timestamp AS t3_debut_calcul_spark,
+    CAST("$file_modified_time" AS TIMESTAMP(3)) AS t4_sysdate_dispo_starburst,
+    
+    -- L'ANALYSE DES TEMPS INTERMÉDIAIRES (En Millisecondes)
+    to_milliseconds(CAST(dh_poc_gen_timestamp AS TIMESTAMP(3)) - CAST(time AS TIMESTAMP(3))) AS ms_reseau_source_vers_s3,
+    to_milliseconds(dh_poc_spark_read_timestamp - CAST(dh_poc_gen_timestamp AS TIMESTAMP(3))) AS ms_attente_avant_batch,
+    to_milliseconds(CAST("$file_modified_time" AS TIMESTAMP(3)) - dh_poc_spark_read_timestamp) AS ms_vrai_calcul_et_ecriture_spark,
+    
+    -- LE TEMPS TOTAL BOUT-EN-BOUT
+    to_milliseconds(CAST("$file_modified_time" AS TIMESTAMP(3)) - CAST(time AS TIMESTAMP(3))) AS ms_latence_totale
+
+FROM dh_poc_hive.pocspark.cloudevent_landing
+WHERE time IS NOT NULL
+ORDER BY "$file_modified_time" DESC
+LIMIT 100;
+```
+
+### Ce que tu vas obtenir à l'écran :
+
+1. **`t3_debut_calcul_spark` et `t4_sysdate_dispo_starburst` seront enfin différents !** Tu verras exactement combien de millisecondes se sont écoulées entre le moment où le cœur Spark a pris la ligne en mémoire (T3) et le moment où le fichier Parquet a été scellé sur S3 et rendu disponible (T4).
+2. **`ms_vrai_calcul_et_ecriture_spark`** te donnera la vraie performance de ton code `.repartition(16)`. Ce chiffre devrait être très bas (quelques centaines de millisecondes).
+3. **`ms_attente_avant_batch`** sera probablement le chiffre le plus élevé (autour de 1000 à 2000 ms), car il représente le temps où la donnée attendait sagement sur S3 que le *Trigger* de Spark se déclenche.
+
+### L'astuce pour ta présentation : Créer une Vue
+
+Si tu ne veux pas avoir à retaper cette grosse requête complexe devant tes managers, crée une **Vue** dans Starburst. Cela créera une "table virtuelle" propre.
+
+```sql
+CREATE OR REPLACE VIEW dh_poc_hive.pocspark.vue_cloudevent_latence AS
+SELECT 
+    id,
+    CAST(time AS TIMESTAMP(3)) AS t1_origine,
+    CAST(dh_poc_gen_timestamp AS TIMESTAMP(3)) AS t2_arrivee_raw,
+    dh_poc_spark_read_timestamp AS t3_debut_calcul_spark,
+    CAST("$file_modified_time" AS TIMESTAMP(3)) AS t4_sysdate_dispo_starburst,
+    to_milliseconds(CAST(dh_poc_gen_timestamp AS TIMESTAMP(3)) - CAST(time AS TIMESTAMP(3))) AS ms_reseau,
+    to_milliseconds(dh_poc_spark_read_timestamp - CAST(dh_poc_gen_timestamp AS TIMESTAMP(3))) AS ms_attente,
+    to_milliseconds(CAST("$file_modified_time" AS TIMESTAMP(3)) - dh_poc_spark_read_timestamp) AS ms_calcul_spark,
+    to_milliseconds(CAST("$file_modified_time" AS TIMESTAMP(3)) - CAST(time AS TIMESTAMP(3))) AS ms_latence_totale
+FROM dh_poc_hive.pocspark.cloudevent_landing;
+```
+
+Ensuite, le jour de la démo, tu as juste à faire :
+`SELECT * FROM dh_poc_hive.pocspark.vue_cloudevent_latence LIMIT 20;`
+
+```json?chameleon
+{"component":"LlmGeneratedComponent","props":{"height":"600px","prompt":"Objectif : Simuler l'affichage de la table Starburst avec les 4 timestamps et les millisecondes calculées. InitialValues : none. Strategy : Standard Layout. Inputs : Bouton 'Rafraîchir les données (Nouveau Micro-batch)'. Behavior : Afficher un tableau de données (Data Grid) stylisé ressemblant à une interface SQL. Colonnes : ID, T1_Origine, T2_S3_Raw, T3_Spark_Read, T4_Sysdate, MS_Reseau, MS_Attente, MS_Calcul, MS_Total. Générer des lignes factices mais mathématiquement cohérentes (ex: T1 = 10:00:00.000, T2 = 10:00:00.150, T3 = 10:00:01.200, T4 = 10:00:01.450 -> Calculs = 150ms, 1050ms, 250ms, 1450ms). Mettre en évidence les colonnes de résultat en millisecondes. Au clic sur le bouton, ajouter de nouvelles lignes en haut du tableau pour simuler le streaming continu. Langue : Français.","id":"im_1a9804b9b3e8315b"}}
+```
+
+Ton script Python tourne et alimente la tuyauterie en temps réel. Cette requête SQL est la loupe qui te permet de lire les résultats exacts. Lance ça de ton côté, et tu auras tes chiffres !
+
 Voici le code complet, unifié et vérifié de bout en bout. 
 
 J'ai relu toute la logique pour m'assurer qu'il n'y ait aucun conflit entre le générateur et le streaming, que le cluster utilise bien tes 16 cœurs, et que la précision des millisecondes soit respectée pour Starburst.
