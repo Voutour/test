@@ -539,3 +539,47 @@ Pour bien visualiser l'impact de tes paramètres sur la "Timeline" de Spark UI (
 ```
 
 En utilisant `maxFilesPerTrigger` couplé à une limite dans ton générateur, tu t'assures que ton test est **fini** (il s'arrête tout seul) et **visible** (la timeline n'est pas saturée, tu peux voir chaque tâche travailler individuellement).
+
+
+
+C'est la confirmation qu'on attendait ! Si l'onglet "Executors" montre bien plusieurs cœurs alloués, alors ton cluster Kubernetes t'a effectivement donné la puissance demandée. 
+
+Le fait que les tâches s'exécutent "les unes après les autres" au lieu de se superposer est donc **exclusivement dû à l'optimisation interne de Spark (le Coupable N°1)**. 
+
+### Pourquoi Spark fait-il ça ? (Le problème des petits fichiers)
+
+Quand tu as un flux de données (Streaming) avec de très petits fichiers (comme nos JSON de test), Spark essaie d'être "trop intelligent". 
+Il regarde la taille des fichiers sur S3 et se dit : *"Ce fichier fait 2 Ko. Le suivant fait 2 Ko. Au lieu de réveiller un cœur CPU pour chaque fichier, je vais tous les donner au même cœur, ça ira plus vite."*
+
+C'est ce qu'on appelle la **"Dynamic Partition Coalescing"** ou le regroupement des partitions. C'est génial pour la production, mais c'est terrible pour ta démo car ça cache complètement le parallélisme sur la Timeline !
+
+### La Solution Définitive : Désactiver l'optimisation
+
+On va ajouter trois configurations spécifiques à ton `SparkSession` pour dire à Spark : *"Sois bête et discipliné. Je veux 1 tâche par fichier lu, même s'ils sont minuscules !"*
+
+Mets à jour l'initialisation de ton code `main_cloudevent.py` avec ces options exactes :
+
+```python
+# 1. INITIALISATION SPARK (Anti-Optimisation pour la Démo)
+spark = SparkSession.builder \
+    .appName("DevX-CloudEvent-Demo") \
+    .config("spark.hadoop.fs.s3a.endpoint", S3_ENDPOINT) \
+    .config("spark.hadoop.fs.s3a.path.style.access", "true") \
+    .config("spark.default.parallelism", "4") \
+    .config("spark.sql.shuffle.partitions", "4") \
+    # --- LES 3 LIGNES MAGIQUES POUR FORCER LE PARALLÉLISME ---
+    .config("spark.sql.files.maxPartitionBytes", "1024") \ # Force des partitions minuscules (1 Ko)
+    .config("spark.sql.files.openCostInBytes", "4194304") \ # Décourage Spark de regrouper les fichiers
+    .config("spark.streaming.concurrentJobs", "4") \       # Permet au Streaming de lancer plusieurs Jobs en même temps
+    .getOrCreate()
+```
+
+### Le comportement attendu après modification :
+
+1. Relance ton script `submit`.
+2. Laisse le générateur créer quelques vagues de fichiers.
+3. Retourne sur ton Spark UI > onglet **Event Timeline**.
+
+Normalement, tu devrais enfin voir un magnifique bloc de tâches vertes s'exécuter **exactement à la même milliseconde** sur les différentes lignes de la timeline. 
+
+C'est le moment de faire ta capture d'écran pour la présentation du PoC ! Est-ce que tu vois bien les barres se superposer cette fois-ci ?
