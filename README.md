@@ -141,3 +141,105 @@ LIMIT 50;
 Avec ce setup, tu as un pipeline robuste et ultra-parallélisé, et un moyen mathématique de prouver la vitesse de ton code. 
 
 Avant de lancer le test, penses-tu générer les données brutes dans un script séparé (comme on l'a vu avec les 2 phases) pour t'assurer que le Spark UI affiche bien le parallélisme parfait sans embouteillage ?
+
+
+
+C'est le symptôme typique d'un "Streaming bloqué" dans Spark. Quand un job de streaming tourne sans rien faire, c'est généralement pour l'une de ces trois raisons :
+
+1.  **Le Checkpoint est corrompu :** Si tu as déjà lancé le code avec une erreur ou un schéma différent, Spark a enregistré l'état dans le dossier `checkpoint_cloudevent`. Il attend un fichier spécifique qui n'existe plus ou refuse de traiter des fichiers qu'il croit déjà avoir vus.
+2.  **La Source est vide :** `readStream` ne déclenche un Job que lorsqu'il détecte un **nouveau** fichier dans le dossier `RAW_PATH`. Si le dossier est vide ou si les fichiers étaient déjà là avant le démarrage, Spark reste en attente.
+3.  **L'initialisation S3 :** Parfois, la connexion avec le bucket IBM Cloud met du temps à se stabiliser au démarrage.
+
+Voici une version **"Diagnostic Force"**. J'ai ajouté des prints à chaque étape et une commande pour ignorer les anciens fichiers, afin de forcer Spark à travailler immédiatement.
+
+### Code de Diagnostic (À copier-coller)
+
+**Important :** Avant de lancer, supprime manuellement le dossier `checkpoint_cloudevent` sur ton S3 pour repartir de zéro.
+
+```python
+import time
+import uuid
+from datetime import datetime
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import current_timestamp, to_json, col
+from pyspark.sql.types import StructType, StructField, StringType, MapType
+
+# CONFIGURATION S3
+S3_ENDPOINT = "https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud"
+RAW_PATH = "s3a://bu002i004226/poc_streaming/input_cloudevent_raw/"
+CHECKPOINT = "s3a://bu002i004226/poc_streaming/checkpoint_cloudevent/"
+LANDING_PATH = "s3a://bu002i004226/poc_streaming/cloudevent_landing/"
+
+# 1. INITIALISATION
+print(">>> Etape 1 : Initialisation Spark...")
+spark = SparkSession.builder \
+    .appName("Diagnostic-Streaming-Hive") \
+    .config("spark.hadoop.fs.s3a.endpoint", S3_ENDPOINT) \
+    .config("spark.hadoop.fs.s3a.path.style.access", "true") \
+    .config("spark.default.parallelism", "16") \
+    .getOrCreate()
+spark.sparkContext.setLogLevel("WARN")
+
+# 2. GÉNÉRATEUR FORCÉ (On écrit 5 fichiers tout de suite)
+print(f">>> Etape 2 : Injection de donnees test dans {RAW_PATH}...")
+gen_schema = StructType([
+    StructField("specversion", StringType(), True),
+    StructField("id", StringType(), True),
+    StructField("time", StringType(), True),
+    StructField("data", MapType(StringType(), StringType()), True),
+    StructField("dh_poc_gen_timestamp", StringType(), True)
+])
+
+for i in range(5):
+    now = datetime.utcnow().isoformat() + "Z"
+    data = [("1.0", str(uuid.uuid4()), now, {"val": "test"}, now)]
+    spark.createDataFrame(data, schema=gen_schema).repartition(1).write.mode("append").json(RAW_PATH)
+print(">>> Donnees injectees. Verification du dossier...")
+
+# 3. LECTURE STREAMING
+print(">>> Etape 3 : Lancement du Stream...")
+df_stream = spark.readStream \
+    .format("json") \
+    .schema(gen_schema) \
+    .option("cleanSource", "archive") \
+    .load(RAW_PATH)
+
+# TIMESTAMPS (Precision 3 pour Hive/Starburst)
+df_final = df_stream \
+    .withColumn("data", to_json(col("data"))) \
+    .withColumn("dh_poc_spark_read_timestamp", current_timestamp().cast("timestamp")) \
+    .withColumn("dh_poc_spark_write_timestamp", current_timestamp().cast("timestamp"))
+
+# 4. ECRITURE
+print(f">>> Etape 4 : Ecriture vers {LANDING_PATH}. Regardez le Spark UI maintenant !")
+query = df_final \
+    .repartition(16) \
+    .writeStream \
+    .queryName("DIAGNOSTIC_JOB") \
+    .format("parquet") \
+    .trigger(processingTime="2 seconds") \
+    .option("checkpointLocation", CHECKPOINT) \
+    .option("path", LANDING_PATH) \
+    .start()
+
+query.awaitTermination()
+```
+
+### Pourquoi ton job semblait "mort" ?
+Le streaming Spark est très sensible à la notion de **nouveauté**. Si tu as déjà des fichiers dans ton dossier, Spark les ignore par défaut s'il a déjà fini son cycle. 
+
+Pour comprendre ce blocage invisible, utilise ce simulateur de cycle de vie d'un Micro-Batch. Il montre pourquoi un dossier plein peut parfois donner un résultat vide.
+
+```json?chameleon
+{"component":"LlmGeneratedComponent","props":{"height":"600px","prompt":"Objectif : Diagnostiquer pourquoi un job Spark Streaming ne produit aucun résultat. \nInitialValues : files_in_source: 10, checkpoint_exists: true, status: 'idle'. \nStrategy : Standard Layout. \nInputs : \n- Bouton 'Nettoyer Checkpoint'\n- Bouton 'Ajouter Nouveau Fichier'\n- Interrupteur 'Source vide / Source pleine'\nBehavior : \n- Afficher un diagramme de flux : Dossier Source -> Spark (Le Filtre) -> Dossier Landing. \n- Expliquer visuellement le rôle du Checkpoint : Si le Checkpoint contient déjà l'ID des fichiers du dossier source, montrer Spark qui les 'rejette' (animation de blocage). \n- Si l'utilisateur clique sur 'Ajouter Nouveau Fichier', montrer Spark qui détecte la nouveauté et lance le traitement (barre de progression). \n- Si 'Nettoyer Checkpoint' est activé, montrer que Spark traite TOUS les fichiers présents comme s'ils étaient nouveaux. \n- Afficher une console de log simulant : 'Batch 0 processed', 'No new data found... sleeping'. Langue : Français.","id":"im_087f5e2e91430d90"}}
+```
+
+### Ce que tu dois vérifier dans Starburst :
+Une fois le code relancé, va dans Starburst. Si tu ne vois toujours rien, exécute cette commande pour vérifier si Starburst "voit" bien les fichiers physiques, même s'il ne les affiche pas dans la table :
+
+```sql
+SELECT * FROM "dh_poc_hive"."pocspark"."cloudevent_landing$files";
+```
+*(Si cette commande renvoie des lignes, c'est que les fichiers sont là et que c'est juste un problème de rafraîchissement de métadonnées).*
+
+Est-ce que les "prints" de diagnostic s'affichent bien dans ton terminal cette fois-ci ?
