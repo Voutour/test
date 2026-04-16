@@ -419,3 +419,123 @@ query.awaitTermination()
     * Va dans l'onglet **Stages** ou **Jobs** et clique sur un Job récent.
     * Déploie le menu **Event Timeline**.
     * Grâce au `repartition(10)` du générateur, tu verras les blocs d'exécution verts (les *Tasks*) s'empiler verticalement les uns au-dessus des autres sur la même seconde. Cela prouve visuellement à ton audience que ton code lit et traite 10 fichiers en parallèle simultanément sur les différents cœurs du cluster !
+  
+    * C'est une très bonne précaution. En phase de test, sans limite, on peut vite saturer le stockage S3 ou consommer tous les crédits du cluster si le générateur s'emballe.
+
+Pour brider ton test, il faut agir à deux niveaux :
+1.  **Au niveau du Générateur (Python) :** Pour qu'il s'arrête de lui-même après avoir envoyé un certain nombre d'événements.
+2.  **Au niveau du Moteur Spark (Streaming) :** Pour qu'il ne lise pas trop de fichiers d'un coup dans un seul micro-batch (ce qui permet de mieux voir la concurrence sur la timeline au lieu d'avoir un énorme bloc compact).
+
+Voici le code complet intégrant ces limites.
+
+### 1. Code Spark avec limites de test
+
+```python
+import threading
+import time
+import uuid
+from datetime import datetime
+from pyspark.sql import SparkSession
+from pyspark.sql.types import StructType, StructField, StringType, MapType
+from pyspark.sql.functions import current_timestamp, to_json, col
+
+# CONFIGURATION S3
+S3_ENDPOINT = "https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud"
+RAW_PATH = "s3a://bu002i004226/poc_streaming/input_cloudevent_raw/"
+CHECKPOINT = "s3a://bu002i004226/poc_streaming/checkpoint_cloudevent/"
+LANDING_PATH = "s3a://bu002i004226/poc_streaming/cloudevent_landing/"
+
+# --- LIMITE DE TEST ---
+MAX_TOTAL_EVENTS = 5000  # Le générateur s'arrêtera après 5000 events
+EVENTS_PER_FILE = 100    # Chaque fichier contiendra 100 events
+# ----------------------
+
+# 1. INITIALISATION SPARK
+spark = SparkSession.builder \
+    .appName("DevX-CloudEvent-Final-Limited") \
+    .config("spark.hadoop.fs.s3a.endpoint", S3_ENDPOINT) \
+    .config("spark.hadoop.fs.s3a.path.style.access", "true") \
+    .config("spark.default.parallelism", "10") 
+    .getOrCreate()
+spark.sparkContext.setLogLevel("WARN")
+
+# 2. GÉNÉRATEUR AVEC LIMITE D'ARRÊT
+def generate_events_limited():
+    gen_schema = StructType([
+        StructField("specversion", StringType(), True),
+        StructField("type", StringType(), True),
+        StructField("source", StringType(), True),
+        StructField("subject", StringType(), True),
+        StructField("id", StringType(), True),
+        StructField("time", StringType(), True),
+        StructField("datacontenttype", StringType(), True),
+        StructField("data", MapType(StringType(), StringType()), True),
+        StructField("dh_poc_gen_timestamp", StringType(), True)
+    ])
+    
+    events_sent = 0
+    print(f"### DÉMARRAGE GÉNÉRATEUR (LIMITE : {MAX_TOTAL_EVENTS} EVENTS) ###")
+    
+    while events_sent < MAX_TOTAL_EVENTS:
+        mock_data = []
+        for i in range(EVENTS_PER_FILE):
+            now = datetime.utcnow().isoformat() + "Z"
+            mock_data.append(("1.0", "sensor", f"dev-{i}", "telemetry", str(uuid.uuid4()), now, "json", {"t": "20"}, now))
+        
+        df = spark.createDataFrame(mock_data, schema=gen_schema)
+        # On écrit 4 fichiers en parallèle pour créer de la concurrence
+        df.repartition(4).write.mode("append").json(RAW_PATH)
+        
+        events_sent += EVENTS_PER_FILE
+        print(f"[GÉNÉRATEUR] Total envoyé : {events_sent}/{MAX_TOTAL_EVENTS}")
+        time.sleep(3)
+        
+    print("### LIMITE ATTEINTE : LE GÉNÉRATEUR S'ARRÊTE ###")
+
+threading.Thread(target=generate_events_limited, daemon=True).start()
+time.sleep(10)
+
+# 3. STREAMING AVEC LIMITE DE LECTURE (Contrôle du débit)
+read_schema = StructType([
+    StructField("specversion", StringType(), True),
+    StructField("type", StringType(), True),
+    StructField("source", StringType(), True),
+    StructField("subject", StringType(), True),
+    StructField("id", StringType(), True),
+    StructField("time", StringType(), True),
+    StructField("datacontenttype", StringType(), True),
+    StructField("data", MapType(StringType(), StringType()), True),
+    StructField("dh_poc_gen_timestamp", StringType(), True)
+])
+
+df_stream = spark.readStream \
+    .format("json") \
+    .schema(read_schema) \
+    .option("maxFilesPerTrigger", 10) \ # --- LIMITE : Spark ne lira que 10 fichiers max par batch
+    .load(RAW_PATH)
+
+df_processed = df_stream \
+    .withColumn("data", to_json(col("data"))) \
+    .withColumn("dh_poc_spark_read_timestamp", current_timestamp())
+
+# ÉCRITURE
+query = df_processed.writeStream \
+    .queryName("CloudEvent_Limited_Test") \
+    .format("parquet") \
+    .trigger(processingTime="2 seconds") \
+    .option("checkpointLocation", CHECKPOINT) \
+    .option("path", LANDING_PATH) \
+    .start()
+
+query.awaitTermination()
+```
+
+### 2. Simulateur de Concurrence et de Limite
+
+Pour bien visualiser l'impact de tes paramètres sur la "Timeline" de Spark UI (concurrence vs durée totale), utilise ce simulateur. Il montre comment la **limite** définit la longueur de ton test, tandis que le **parallélisme** définit sa hauteur (concurrence).
+
+```json?chameleon
+{"component":"LlmGeneratedComponent","props":{"height":"700px","prompt":"Simulateur de flux Spark Streaming avec limites de test. \nObjectif : Comprendre comment la limite d'événements et le nombre de threads affectent la timeline Spark UI. \nInitialValues : total_events: 1000, batch_size: 100, threads: 4. \nStrategy : Standard Layout. \nInputs : \n- Curseur 'Limite totale (Events)' (500 à 10000)\n- Curseur 'Taille du micro-batch (Events/batch)'\n- Curseur 'Degré de parallélisme (Threads)' (1 à 16).\nBehavior : \n- Afficher une file d'attente d'événements (Ingestion).\n- Afficher un cluster de Threads de traitement.\n- Simuler en temps réel le passage des événements dans les threads.\n- En bas, dessiner une réplique simplifiée de la 'Event Timeline' de Spark UI : des barres horizontales empilées (une par thread). \n- Plus le parallélisme est haut, plus il y a de barres empilées verticalement.\n- Plus la limite est haute, plus les barres s'étirent horizontalement dans le temps.\n- Afficher les stats : Débit réel, Temps total estimé, et Latence moyenne. \nLangue : Français.","id":"im_a50befe343558dc2"}}
+```
+
+En utilisant `maxFilesPerTrigger` couplé à une limite dans ton générateur, tu t'assures que ton test est **fini** (il s'arrête tout seul) et **visible** (la timeline n'est pas saturée, tu peux voir chaque tâche travailler individuellement).
