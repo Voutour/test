@@ -1,3 +1,111 @@
+import threading
+import time
+import uuid
+from datetime import datetime
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import current_timestamp, to_json, col
+from pyspark.sql.types import StructType, StructField, StringType, MapType
+
+# ==========================================
+# CONFIGURATION S3 & CHEMINS
+# ==========================================
+S3_ENDPOINT = "https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud"
+RAW_PATH = "s3a://bu002i004226/poc_streaming/input_cloudevent_raw/"
+CHECKPOINT = "s3a://bu002i004226/poc_streaming/checkpoint_cloudevent/"
+LANDING_PATH = "s3a://bu002i004226/poc_streaming/cloudevent_landing/"
+
+# ==========================================
+# 1. INITIALISATION SPARK (Mode Performance)
+# ==========================================
+spark = SparkSession.builder \
+    .appName("DevX-Hive-Full-Pipeline") \
+    .config("spark.hadoop.fs.s3a.endpoint", S3_ENDPOINT) \
+    .config("spark.hadoop.fs.s3a.path.style.access", "true") \
+    .config("spark.default.parallelism", "16") \
+    .config("spark.sql.shuffle.partitions", "16") \
+    .getOrCreate()
+
+# On masque les logs inutiles pour y voir clair dans la console
+spark.sparkContext.setLogLevel("WARN")
+
+# ==========================================
+# 2. SCHÉMA DU CLOUDEVENT
+# ==========================================
+schema_events = StructType([
+    StructField("specversion", StringType(), True),
+    StructField("type", StringType(), True),
+    StructField("source", StringType(), True),
+    StructField("subject", StringType(), True),
+    StructField("id", StringType(), True),
+    StructField("time", StringType(), True), # T1 : Origine
+    StructField("datacontenttype", StringType(), True),
+    StructField("data", MapType(StringType(), StringType()), True),
+    StructField("dh_poc_gen_timestamp", StringType(), True) # T2 : Arrivée S3 Raw
+])
+
+# ==========================================
+# 3. LE GÉNÉRATEUR (Fini, s'arrête tout seul)
+# ==========================================
+def generate_events():
+    max_vagues = 15 # Le générateur s'arrêtera après 15 vagues (environ 1 minute)
+    print(f"\n### [GÉNÉRATEUR] Démarrage - Limite fixée à {max_vagues} vagues ###")
+    
+    for batch_count in range(1, max_vagues + 1):
+        mock_data = []
+        for i in range(160): # 160 événements par vague
+            now = datetime.utcnow().isoformat() + "Z"
+            mock_data.append(("1.0", "sensor", f"dev-{i}", "telemetry", str(uuid.uuid4()), now, "json", {"t": "20"}, now))
+        
+        # On crée le DataFrame et on l'écrit en 4 fichiers JSON pour simuler plusieurs sources
+        df_gen = spark.createDataFrame(mock_data, schema=schema_events)
+        df_gen.coalesce(4).write.mode("append").json(RAW_PATH)
+        
+        print(f"### [GÉNÉRATEUR] Vague {batch_count}/{max_vagues} déposée sur S3 Raw ###")
+        time.sleep(3) # Pause de 3 secondes entre chaque vague
+        
+    print("### [GÉNÉRATEUR] TERMINÉ. Fin de la production des données brutes. ###\n")
+
+# Lancement du générateur en arrière-plan
+threading.Thread(target=generate_events, daemon=True).start()
+
+# IMPORTANT : On laisse le générateur créer le dossier et les premiers fichiers
+# Si le readStream démarre avant que le dossier n'existe sur S3, il peut planter.
+print("### [SYSTÈME] Initialisation de l'environnement S3 (Attente 10s)... ###")
+time.sleep(10)
+
+# ==========================================
+# 4. LE STREAMING (Le Consommateur 16 Cœurs)
+# ==========================================
+print("### [STREAMING] Démarrage de la lecture continue sur 16 cœurs ###\n")
+
+# LECTURE (T3 est implicitement le moment où le trigger se déclenche)
+df_stream = spark.readStream \
+    .format("json") \
+    .schema(schema_events) \
+    .option("maxFilesPerTrigger", 32) \
+    .load(RAW_PATH)
+
+# TRANSFORMATIONS (Ajout des timestamps en natif pour compatibilité Trino/Hive)
+df_processed = df_stream \
+    .withColumn("data", to_json(col("data"))) \
+    .withColumn("dh_poc_spark_read_timestamp", current_timestamp().cast("timestamp")) \
+    .withColumn("dh_poc_spark_write_timestamp", current_timestamp().cast("timestamp"))
+
+# ÉCRITURE (Mur vertical : on force le traitement sur les 16 cœurs)
+query = df_processed \
+    .repartition(16) \
+    .writeStream \
+    .queryName("Hive_Streaming_Perfect_Parallelism") \
+    .format("parquet") \
+    .outputMode("append") \
+    .trigger(processingTime="2 seconds") \
+    .option("checkpointLocation", CHECKPOINT) \
+    .option("path", LANDING_PATH) \
+    .start()
+
+# Maintient le programme en vie indéfiniment
+query.awaitTermination()
+
 Ah ! Je te demande pardon, c'est totalement de ma faute. Le code que je t'ai donné dans le message précédent ne contenait **que la partie "Consommateur"** (le `readStream`). 
 
 Comme tu n'as pas lancé de générateur de données à côté, le dossier S3 `input_cloudevent_raw` était vide. Spark s'est donc mis sur écoute, n'a rien trouvé, et a attendu indéfiniment sans rien faire. Pas de données = pas de micro-batch = pas de job actif dans l'UI.
