@@ -172,3 +172,130 @@ Pour comprendre pourquoi nous faisons tout cela, voici une visualisation de la f
 ```
 
 Dès que tu lances le `INSERT INTO` final, ta table Iceberg `dh_poc_ice.pocspark.cloudevent_raw` contiendra l'historique complet. Tu pourras alors calculer tes KPIs de performance réelle !
+
+
+
+
+
+C'est entendu. Oublions les passerelles, les `INSERT` manuels et les solutions de contournement. On va mettre en place la **solution native Iceberg**, telle qu'elle est censée fonctionner dans une architecture Data Lakehouse industrielle.
+
+Pour que Spark écrive et que Starburst voie les données instantanément, ils doivent partager le **même catalogue (le Metastore)**. Puisque tu as désormais les deux connecteurs (`hive` et `iceberg`), nous allons configurer Spark pour qu'il agisse comme un membre à part entière du catalogue Iceberg.
+
+### La Solution "Directe" : Couplage Natif Spark-Iceberg
+
+Dans cette configuration, Spark ne dépose pas juste des fichiers ; il effectue des **transactions Iceberg**. Chaque fois que Spark finit d'écrire un micro-batch, il met à jour le catalogue. Starburst, qui surveille ce même catalogue, voit la nouvelle version de la table immédiatement.
+
+#### 1. Configuration de la Table dans Starburst (Iceberg)
+Lance cette commande une seule fois. C'est la table "Mère" que Spark va alimenter directement.
+
+```sql
+-- On crée la table DIRECTEMENT dans le catalogue Iceberg
+CREATE TABLE IF NOT EXISTS dh_poc_ice.pocspark.cloudevent_raw (
+    specversion VARCHAR,
+    type VARCHAR,
+    source VARCHAR,
+    subject VARCHAR,
+    id VARCHAR,
+    time VARCHAR,
+    datacontenttype VARCHAR,
+    data VARCHAR,
+    -- Timestamps pour ton analyse de latence (T1, T2, T3)
+    dh_poc_gen_timestamp VARCHAR,
+    dh_poc_spark_read_timestamp TIMESTAMP(6) WITH TIME ZONE
+)
+WITH (
+    format = 'PARQUET',
+    location = 's3a://bu002i004226/poc_streaming/cloudevent_direct/'
+);
+```
+
+#### 2. Le Code Spark Direct (`main_cloudevent.py`)
+Ici, Spark se connecte au catalogue Iceberg de la banque. **Attention** : Tu dois récupérer l'URI du Metastore (souvent `thrift://...`) auprès de ton équipe infra ou la trouver dans tes configs Hadoop.
+
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import current_timestamp, to_json, col
+import threading
+import time
+import uuid
+from datetime import datetime
+
+# CONFIGURATION
+S3_ENDPOINT = "https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud"
+# REMPLACE PAR LA VRAIE URI THRIFT DE TON INFRA
+HMS_URI = "thrift://METASTORE_HOST:9083" 
+
+# 1. INIT SPARK - CONNEXION NATIVE AU CATALOGUE
+spark = SparkSession.builder \
+    .appName("Iceberg-Direct-Streaming") \
+    .config("spark.hadoop.fs.s3a.endpoint", S3_ENDPOINT) \
+    .config("spark.hadoop.fs.s3a.path.style.access", "true") \
+    .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
+    .config("spark.sql.catalog.iceberg_cat", "org.apache.iceberg.spark.SparkCatalog") \
+    .config("spark.sql.catalog.iceberg_cat.type", "hive") \
+    .config("spark.sql.catalog.iceberg_cat.uri", HMS_URI) \
+    .getOrCreate()
+
+# 2. GÉNÉRATEUR (T1, T2)
+def generate():
+    while True:
+        now = datetime.utcnow().isoformat() + "Z"
+        data = [("1.0", "sensor", "dev", "telemetry", str(uuid.uuid4()), now, "json", {"v": "20"}, now)]
+        df = spark.createDataFrame(data, "specversion string, type string, source string, subject string, id string, time string, datacontenttype string, data map<string,string>, dh_poc_gen_timestamp string")
+        df.write.mode("append").json("s3a://bu002i004226/poc_streaming/raw_input/")
+        time.sleep(5)
+
+threading.Thread(target=generate, daemon=True).start()
+
+# 3. STREAMING DIRECT VERS LA TABLE (T3)
+df_stream = spark.readStream \
+    .format("json") \
+    .schema(spark.table("iceberg_cat.pocspark.cloudevent_raw").schema) \
+    .load("s3a://bu002i004226/poc_streaming/raw_input/")
+
+df_final = df_stream \
+    .withColumn("data", to_json(col("data"))) \
+    .withColumn("dh_poc_spark_read_timestamp", current_timestamp())
+
+# L'écriture directe : Spark met à jour le catalogue Iceberg à chaque commit
+query = df_final.writeStream \
+    .format("iceberg") \
+    .outputMode("append") \
+    .trigger(processingTime="5 seconds") \
+    .option("checkpointLocation", "s3a://bu002i004226/poc_streaming/checkpoints_direct/") \
+    .toTable("iceberg_cat.pocspark.cloudevent_raw")
+
+query.awaitTermination()
+```
+
+---
+
+### Comment obtenir le "T4" (Moment où Starburst voit la donnée) ?
+
+C'est la condition sine qua non. Pour mesurer la latence réelle de Starburst **sans ajouter de colonne manuelle**, on utilise la puissance des **tables de métadonnées Iceberg**. 
+
+Iceberg enregistre l'heure exacte de chaque transaction (`committed_at`). Dans Starburst, tu peux interroger l'historique pour voir quand le "cerveau" de la base a validé les données :
+
+```sql
+-- Cette requête te donne le T4 réel : le moment précis où la transaction est devenue visible
+SELECT 
+    h.snapshot_id,
+    h.committed_at AS t4_starburst_visibility,
+    s.summary['total-records'] as records_added
+FROM "dh_poc_ice"."pocspark"."cloudevent_raw$history" h
+JOIN "dh_poc_ice"."pocspark"."cloudevent_raw$snapshots" s ON h.snapshot_id = s.snapshot_id
+ORDER BY h.committed_at DESC;
+```
+
+
+
+### Pourquoi cette solution est la "vraie" :
+1.  **Atomicité** : Soit tout le batch est visible, soit rien. Pas de fichiers partiels.
+2.  **Zéro Latence Humaine** : Spark prévient Starburst via le Metastore. Dès que le job Spark affiche "Batch processed", le `SELECT` dans Starburst renvoie les lignes.
+3.  **Vraie Observabilité** : En comparant `time` (T1), `dh_poc_spark_read_timestamp` (T3) et le `committed_at` (T4) de la table `$history`, tu as la mesure exacte de la latence de ton infrastructure.
+
+```json?chameleon
+{"component":"LlmGeneratedComponent","props":{"height":"700px","prompt":"Objectif : Visualiser le couplage direct Spark-Iceberg via le Metastore. \nInitialValues : connection_metastore: true, spark_writing: true. \nStrategy : Standard Layout. \nInputs : Interrupteur 'Simuler Transaction Spark'. \nBehavior : Afficher 3 blocs : Spark, Hive Metastore (HMS), et Starburst. \n1. Quand Spark écrit, montrer un flux vers S3 (Fichiers Data) ET un flux vers le HMS (Mise à jour du Pointeur de Snapshot). \n2. Montrer que Starburst lit le HMS pour savoir quel fichier S3 ouvrir. \n3. Afficher les 4 points de mesure (T1 Origine, T2 S3, T3 Spark, T4 HMS Commit). \n4. Illustrer que sans la mise à jour HMS, Starburst reste aveugle aux données S3. Langue : Français.","id":"im_c804a5aa92dd18eb"}}
+```
+
+Si cette configuration échoue avec un `Access Denied`, cela confirme que la Sandbox interdit à Spark d'écrire dans le Metastore. Dans ce cas, la solution "Directe" est physiquement impossible pour des raisons de sécurité bancaire, et non pour des raisons de code. Mais techniquement, c'est **le** standard que tu dois viser.
