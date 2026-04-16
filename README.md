@@ -1,130 +1,86 @@
-Tu viens de mettre le doigt sur l'un des pièges les plus vicieux de Spark quand on essaie de simuler un flux de données, et ton observation sur le "délai" est la clé absolue pour comprendre ce qui a cloché.
+C'est la cerise sur le gâteau. Intégrer ton pipeline dans un portail développeur (DevX) via une API, c'est ce qui transforme un "script data" en un véritable **Produit Data (Data Product)**.
 
-Je te présente mes excuses : le problème ne venait pas de ton cluster (qui est très puissant avec ses 16 cœurs), mais de **mon architecture de test**.
+Pour que DevX puisse déclencher ton job Spark sur demande, il faut tenir compte d'une contrainte majeure : **un job de streaming Spark prend du temps** (ou tourne à l'infini). Si DevX fait un appel API classique, la requête va tourner dans le vide et faire un "Timeout" au bout de 30 secondes.
 
-### Le Diagnostic : L'embouteillage (FIFO)
+Il faut donc une **API Asynchrone** : DevX dit "Lance le job", l'API répond immédiatement "C'est noté, je m'en occupe", et le job Spark démarre en arrière-plan.
 
-Dans le code précédent, j'ai mis le "Générateur" dans un *Thread* (en arrière-plan) et le "Streaming" en tâche principale. Le problème, c'est que le générateur utilisait la commande `spark.createDataFrame` pour fabriquer les fausses données.
+Voici comment mettre ça en place pour ton PoC, et comment cela fonctionnera en production.
 
-Ce que j'ai ignoré, c'est la règle d'or de Spark : **Spark fonctionne par défaut en mode FIFO (First In, First Out).**
+### 1. La Solution PoC : Le Wrapper FastAPI
 
-Puisque le Générateur et le Streaming utilisent exactement le **même cluster Spark** en même temps :
-1. Le Générateur demande aux 16 cœurs d'écrire des JSON sur S3.
-2. Une milliseconde plus tard, le Streaming se réveille et demande aux 16 cœurs de lire les S3.
-3. Le chef d'orchestre Spark dit au Streaming : *"Fais la queue ! Attends que le Générateur ait terminé."*
+Puisque tu es dans une Sandbox avec des droits limités, la méthode la plus simple est de créer une mini-API Python (avec le framework `FastAPI`) qui va s'installer juste à côté de tes scripts et "appuyer sur le bouton" à ta place.
 
-C'est ce temps d'attente (cette file d'attente interne) qui a créé le "délai" que tu as vu, et qui a forcé les tâches à s'exécuter de manière hachée et séquentielle. Ils se battaient pour les mêmes ressources.
-
-### La Vraie Solution : La Pré-génération (Séparation des phases)
-
-Pour avoir un rendu visuel parfait sur ta *Timeline* (un magnifique mur de 16 tâches empilées verticalement sans aucun délai), on doit arrêter de faire les deux en même temps.
-
-On va modifier le code pour qu'il fonctionne en **2 phases distinctes** :
-* **Phase 1 :** Spark crée un gros stock de fichiers sur S3 (Le générateur fait tout son travail d'un coup, puis s'arrête définitivement).
-* **Phase 2 :** Le Streaming démarre. Il va voir un énorme stock de fichiers en attente, et comme il a les 16 cœurs pour lui tout seul, il va les avaler par paquets parfaits de 16, en parallèle total.
-
-Voici le code nettoyé et infaillible pour ta démo. N'oublie pas de supprimer les dossiers sur S3 avant de le lancer.
-
-```python
-import time
-import uuid
-from datetime import datetime
-from pyspark.sql import SparkSession
-from pyspark.sql.types import StructType, StructField, StringType, MapType
-from pyspark.sql.functions import current_timestamp, to_json, col
-
-# CONFIGURATION S3
-S3_ENDPOINT = "https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud"
-RAW_PATH = "s3a://bu002i004226/poc_streaming/input_cloudevent_raw/"
-CHECKPOINT = "s3a://bu002i004226/poc_streaming/checkpoint_cloudevent/"
-LANDING_PATH = "s3a://bu002i004226/poc_streaming/cloudevent_landing/"
-
-# 1. INITIALISATION SPARK
-spark = SparkSession.builder \
-    .appName("DevX-CloudEvent-Parallel-Demo") \
-    .config("spark.hadoop.fs.s3a.endpoint", S3_ENDPOINT) \
-    .config("spark.hadoop.fs.s3a.path.style.access", "true") \
-    .config("spark.default.parallelism", "16") \
-    .config("spark.sql.shuffle.partitions", "16") \
-    .getOrCreate()
-spark.sparkContext.setLogLevel("WARN")
-
-# ==========================================
-# PHASE 1 : PRÉ-GÉNÉRATION (Séquentielle, sans Thread)
-# ==========================================
-print("### PHASE 1 : PRÉ-GÉNÉRATION DU STOCK DE DONNÉES SUR S3 ###")
-gen_schema = StructType([
-    StructField("specversion", StringType(), True),
-    StructField("type", StringType(), True),
-    StructField("source", StringType(), True),
-    StructField("subject", StringType(), True),
-    StructField("id", StringType(), True),
-    StructField("time", StringType(), True),
-    StructField("datacontenttype", StringType(), True),
-    StructField("data", MapType(StringType(), StringType()), True),
-    StructField("dh_poc_gen_timestamp", StringType(), True)
-])
-
-# On va générer 60 petits fichiers S3 indépendants
-# Spark va faire ça tout seul, sans que le streaming ne le dérange
-for i in range(60):
-    mock_data = []
-    for j in range(50): # 50 événements par fichier
-        now = datetime.utcnow().isoformat() + "Z"
-        mock_data.append(("1.0", "sensor", f"dev-{j}", "telemetry", str(uuid.uuid4()), now, "json", {"t": "20"}, now))
-    
-    df = spark.createDataFrame(mock_data, schema=gen_schema)
-    # On force la création d'1 fichier par itération pour faire un beau stock
-    df.repartition(1).write.mode("append").json(RAW_PATH)
-    print(f"Fichier S3 généré : {i+1}/60")
-
-print("### PRÉ-GÉNÉRATION TERMINÉE. LE CLUSTER EST LIBRE. ###")
-time.sleep(2) # Petite pause pour laisser le système respirer
-
-# ==========================================
-# PHASE 2 : STREAMING (Concurrence Parfaite)
-# ==========================================
-print("### PHASE 2 : DÉMARRAGE DU STREAMING SUR 16 CŒURS ###")
-read_schema = StructType([
-    StructField("specversion", StringType(), True),
-    StructField("type", StringType(), True),
-    StructField("source", StringType(), True),
-    StructField("subject", StringType(), True),
-    StructField("id", StringType(), True),
-    StructField("time", StringType(), True),
-    StructField("datacontenttype", StringType(), True),
-    StructField("data", MapType(StringType(), StringType()), True),
-    StructField("dh_poc_gen_timestamp", StringType(), True)
-])
-
-# LECTURE : On demande à Spark d'avaler exactement 16 fichiers par batch (1 par cœur !)
-df_stream = spark.readStream \
-    .format("json") \
-    .schema(read_schema) \
-    .option("maxFilesPerTrigger", 16) \
-    .load(RAW_PATH)
-
-df_processed = df_stream \
-    .withColumn("data", to_json(col("data"))) \
-    .withColumn("dh_poc_spark_read_timestamp", current_timestamp())
-
-# ÉCRITURE : On force la distribution sur les 16 cœurs
-query = df_processed \
-    .repartition(16) \
-    .writeStream \
-    .queryName("Demo_Perfect_Parallelism") \
-    .format("parquet") \
-    .trigger(processingTime="1 seconds") \
-    .option("checkpointLocation", CHECKPOINT) \
-    .option("path", LANDING_PATH) \
-    .start()
-
-query.awaitTermination()
+**A. Installe les prérequis dans ton terminal Sandbox :**
+```bash
+pip install fastapi uvicorn
 ```
 
-### Le test en direct :
+**B. Crée le fichier `api_trigger.py` :**
+Ce code va créer un serveur web léger qui écoute les requêtes de DevX et lance ton script bash (celui que tu utilisais manuellement jusqu'ici).
 
-1. Quand tu vas lancer ce script, le terminal va d'abord afficher les 60 fichiers se créer (ça prendra un peu de temps, c'est normal). **Il n'y a pas de streaming à ce moment-là.**
-2. Dès que le message `PHASE 2` apparaît, le listener se déclenche.
-3. Il va voir le stock de 60 fichiers. Il va en prendre **exactement 16** (grâce à `maxFilesPerTrigger=16`), et les donner à tes 16 cœurs en même temps.
-4. Va voir ton **Spark UI -> Stages -> Event Timeline**. Je te garantis que tu auras un beau bloc vertical de tâches empilées.
+```python
+from fastapi import FastAPI, BackgroundTasks
+import subprocess
+import time
+
+app = FastAPI(title="API Spark Streaming - DevX")
+
+def launch_spark_job():
+    print(f"[{time.strftime('%H:%M:%S')}] Lancement du job Spark en arrière-plan...")
+    try:
+        # Remplace par la commande exacte que tu tapes d'habitude dans ton terminal
+        # Par exemple : ["bash", "submit_sparktacus.sh"] ou ["spark-submit", "main_cloudevent.py"]
+        subprocess.run(["bash", "submit_sparktacus.sh"], check=True)
+        print("Job Spark terminé avec succès.")
+    except subprocess.CalledProcessError as e:
+        print(f"Erreur lors de l'exécution du job : {e}")
+
+@app.post("/api/v1/trigger-pipeline")
+async def trigger_pipeline(background_tasks: BackgroundTasks):
+    # L'astuce est ici : on délègue le travail à une tâche de fond
+    background_tasks.add_task(launch_spark_job)
+    
+    # DevX reçoit sa réponse immédiatement en quelques millisecondes
+    return {
+        "status": "success", 
+        "message": "Ordre reçu. Le cluster Spark démarre l'ingestion S3 en arrière-plan.",
+        "timestamp": time.strftime('%Y-%m-%dT%H:%M:%SZ')
+    }
+```
+
+**C. Démarre l'API :**
+Laisse tourner cette commande dans ton terminal.
+```bash
+uvicorn api_trigger:app --host 0.0.0.0 --port 8000
+```
+
+### 2. Comment DevX va appeler ton code
+
+Maintenant que ton API écoute, l'équipe DevX (ou toi-même depuis un autre terminal pour tester) peut déclencher le pipeline d'une simple requête HTTP POST.
+
+**La commande de test (cURL) :**
+```bash
+curl -X 'POST' \
+  'http://localhost:8000/api/v1/trigger-pipeline' \
+  -H 'accept: application/json'
+```
+
+**Ce qu'il va se passer :**
+1. DevX reçoit instantanément le JSON `{"status": "success"...}`. Son interface affiche un beau check vert à l'utilisateur.
+2. Dans le terminal où tourne ton API, tu vas voir Spark se réveiller, s'initialiser et lancer tes 16 cœurs pour attaquer le S3 !
+
+### Visualisation de l'Architecture Asynchrone
+Pour bien expliquer ce flux à l'équipe DevX (qui n'est pas forcément experte en Data), voici un diagramme interactif de ce que l'on vient de construire.
+
+```json?chameleon
+{"component":"LlmGeneratedComponent","props":{"height":"600px","prompt":"Objectif : Visualiser l'architecture d'un appel API asynchrone entre un portail DevX et un cluster Spark. InitialValues : etat: 'repos'. Stratégie : Standard Layout. Entrées : Bouton 'Envoyer Requête API depuis DevX'. Comportement : Afficher trois composants de gauche à droite : Portail DevX, API Wrapper (FastAPI), et Cluster Spark/S3. Au clic, animer une requête HTTP POST qui part de DevX vers l'API. L'API renvoie immédiatement une flèche de retour 'HTTP 200 OK' vers DevX (qui affiche 'Succès'). Simultanément, l'API envoie un ordre de lancement au Cluster Spark. Animer le cluster Spark qui s'allume et commence à traiter des fichiers vers S3 pendant plusieurs secondes. Ajouter un texte expliquant que grâce à ce découplage, le portail DevX n'est pas bloqué pendant que la data est traitée. Langue : Français.","id":"im_68771984aa3712d1"}}
+```
+
+### 3. La vraie Cible de Production (Pour ta présentation)
+
+Dans un vrai environnement de production bancaire post-PoC, on n'utilise généralement pas de mini-API maison (`subprocess`). Tu pourras préciser à tes architectes que l'intégration finale avec DevX se fera via l'un des deux standards du marché :
+
+1. **Apache Livy :** C'est un service REST officiel de l'écosystème Hadoop/Spark. DevX envoie un JSON avec le chemin de ton fichier `.py` sur S3, et Livy gère le cluster.
+2. **Spark Kubernetes Operator :** DevX envoie une requête à l'API de Kubernetes pour créer une ressource appelée `SparkApplication`. Kubernetes s'occupe de créer le pod, de le lancer et de le détruire quand c'est fini.
+
+Mais pour valider la faisabilité technique de bout en bout (du clic sur l'interface au stockage Iceberg), ce petit pont FastAPI est exactement ce qu'il te faut ! Tu as maintenant un produit data actionnable.
