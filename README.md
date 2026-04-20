@@ -1,3 +1,135 @@
+Nous avançons ! Ces deux erreurs sont des grands classiques de Spark Streaming et de l'interconnexion entre systèmes. Elles ont des causes très logiques.
+
+Voici l'explication de ce qui s'est passé sous le capot, et la correction pour blinder le code.
+
+### 1. L'erreur "Ne trouve pas chaque json" (Le fantôme du Checkpoint)
+C'est le **piège n°1** de Spark Streaming. Dans le code, j'ai mis un dossier `checkpointLocation`. Le rôle de ce dossier est de dire à Spark : *"Souviens-toi des fichiers que tu as déjà lus pour ne pas les relire en cas de crash"*.
+* **Le problème :** Lors de ton premier test, Spark a noté dans son checkpoint : *"J'ai lu le fichier json_A"*. Ensuite, on a relancé le code. Le générateur a écrasé l'ancien dossier (`mode("overwrite")`) et créé un nouveau `json_B`. 
+* **Le crash :** Spark a lu son vieux checkpoint, a cherché `json_A` sur le S3, ne l'a pas trouvé (puisqu'il a été écrasé), et a paniqué.
+* **La solution :** Pour des tests de PoC, il faut **générer un nom de dossier de checkpoint unique à chaque lancement** (avec un timestamp par exemple).
+
+### 2. L'erreur "fatale while calling save" (Le choc Spark vs Starburst)
+Cette erreur signifie que Spark a réussi à se connecter à Starburst, mais que **Starburst a refusé la requête SQL**. 
+Il y a trois raisons possibles à cela :
+1. **La table n'existe pas :** Tu n'as pas exécuté la commande `CREATE TABLE` dans Starburst avant de lancer Spark.
+2. **Nom de table incomplet :** Le driver Trino exige parfois le chemin complet (Catalogue.Schema.Table) dans l'option `dbtable`.
+3. **Incompatibilité de format :** Spark essaie d'envoyer un format de date que Starburst ne comprend pas.
+
+---
+
+### Le Code Blindé (Spécial Débogage)
+
+Voici le code corrigé. J'ai ajouté un système de Checkpoint dynamique (pour régler l'erreur des JSON introuvables) et j'ai amélioré le bloc d'erreur JDBC pour qu'il t'affiche **la vraie raison** du refus de Starburst si ça plante encore.
+
+```python
+import time
+import uuid
+import traceback
+from datetime import datetime
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import current_timestamp, col
+from pyspark.sql.types import StructType, StructField, StringType, MapType
+
+# ==========================================
+# 1. CONFIGURATIONS
+# ==========================================
+S3_ENDPOINT = "https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud"
+S3_RAW_PATH = "s3a://bu002i004226/poc_streaming/input_cloudevent_raw/"
+
+# SOLUTION ERREUR 1 : Un dossier de checkpoint unique par exécution !
+run_id = int(time.time())
+CHECKPOINT_PATH = f"s3a://bu002i004226/poc_streaming/checkpoint_direct_{run_id}/"
+
+STARBURST_JDBC_URL = "jdbc:trino://<HOST_STARBURST>:443/dh_poc_ice"
+STARBURST_USER = "votre_utilisateur"
+STARBURST_PASS = "votre_mot_de_passe"
+
+# ==========================================
+# 2. INITIALISATION SPARK
+# ==========================================
+spark = SparkSession.builder \
+    .appName("PoC-Push-To-Starburst-Direct") \
+    .config("spark.hadoop.fs.s3a.endpoint", S3_ENDPOINT) \
+    .config("spark.hadoop.fs.s3a.path.style.access", "true") \
+    .config("spark.sql.shuffle.partitions", "4") \
+    .config("spark.jars.packages", "io.trino:trino-jdbc:435") \
+    .getOrCreate()
+    
+spark.sparkContext.setLogLevel("WARN")
+
+schema_events = StructType([
+    StructField("id", StringType(), True),
+    StructField("time", StringType(), True),
+    StructField("dh_poc_gen_timestamp", StringType(), True)
+])
+
+# ==========================================
+# 3. GÉNÉRATION DES DONNÉES (Uniquement si le dossier est vide)
+# ==========================================
+print("### [ÉTAPE 1] Génération d'un lot de données de test... ###")
+mock_data = []
+for i in range(50): # Petit batch de 50 pour le test
+    now = datetime.utcnow().isoformat() + "Z"
+    mock_data.append((str(uuid.uuid4()), now, now))
+
+df_gen = spark.createDataFrame(mock_data, schema=schema_events)
+# On écrase proprement
+df_gen.write.mode("overwrite").json(S3_RAW_PATH)
+print("### [ÉTAPE 1] 50 événements générés avec succès. ###\n")
+
+# ==========================================
+# 4. STREAMING : PUSH VERS STARBURST
+# ==========================================
+print("### [ÉTAPE 2] DÉMARRAGE DU STREAMING : SPARK -> JDBC -> STARBURST ###")
+
+df_stream = spark.readStream.format("json").schema(schema_events).load(S3_RAW_PATH)
+
+# Ajout du T3
+df_processed = df_stream.select(
+    col("id"),
+    col("time"), # T1
+    col("dh_poc_gen_timestamp"), # T2
+    current_timestamp().cast("timestamp").alias("dh_poc_spark_read_timestamp") # T3
+)
+
+# Fonction d'écriture par micro-batch via JDBC
+def push_to_starburst(df, batch_id):
+    if not df.isEmpty():
+        print(f"### Tentative d'envoi du batch {batch_id}... ###")
+        try:
+            df.repartition(2).write \
+                .format("jdbc") \
+                .option("url", STARBURST_JDBC_URL) \
+                .option("dbtable", "dh_poc_ice.pocspark.cloudevent_direct") \
+                .option("user", STARBURST_USER) \
+                .option("password", STARBURST_PASS) \
+                .option("driver", "io.trino.jdbc.TrinoDriver") \
+                .mode("append") \
+                .save()
+            print(f"### -> Batch {batch_id} inséré avec succès dans Starburst ! ###")
+        except Exception as e:
+            print(f"\n[!!!] ERREUR FATALE STARBURST SUR LE BATCH {batch_id} [!!!]")
+            print("Voici le message exact renvoyé par la base de données :")
+            # Cette ligne va extraire l'erreur SQL (ex: Table not found, Type mismatch, etc.)
+            print(str(e))
+            print("--------------------------------------------------\n")
+
+query = df_processed.writeStream \
+    .foreachBatch(push_to_starburst) \
+    .option("checkpointLocation", CHECKPOINT_PATH) \
+    .trigger(processingTime="5 seconds") \
+    .start()
+
+query.awaitTermination()
+```
+
+### Ton plan d'action avant de relancer :
+1. **As-tu bien lancé la commande `CREATE TABLE ...`** dans l'interface de Starburst avant de faire tourner ce code ? (Le code Spark ne peut pas créer la table Iceberg tout seul via JDBC, elle doit exister).
+2. Si le code plante à nouveau sur le `save()`, regarde dans la console. L'exception Python va maintenant t'afficher un gros bloc `[!!!] ERREUR FATALE STARBURST...`. 
+
+Dis-moi exactement ce qui est écrit juste en dessous de ce bloc (ça nous donnera l'erreur SQL précise) !
+
+
 Le fait que ça ait "un peu run" (tourné quelques instants) avant de planter est en réalité une **excellente nouvelle** ! Cela prouve que ton réseau est ouvert, que tes identifiants sont bons, que le driver JDBC est bien téléchargé et que Spark arrive à parler à Starburst. On a passé le plus dur.
 
 Quand un flux JDBC plante après quelques secondes de fonctionnement normal, c'est presque toujours dû à un problème de "rythme" ou de "charge". 
