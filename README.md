@@ -1,3 +1,129 @@
+Voici le script complet et définitif. Il intègre ta véritable URL interne BNP Paribas, la sécurisation de tes identifiants via les variables d'environnement, et surtout, **le téléchargement automatique du driver Java Trino par Spark**, ce qui t'évitera l'erreur de module introuvable.
+
+J'ai également ajouté `load_dotenv()` pour que le script lise bien ton fichier `.env` comme on a pu le voir sur ta capture d'écran.
+
+### Le Code Spark PySpark "Push JDBC" Final (`main_cloudevent.py`)
+
+```python
+import os
+import threading
+import time
+import uuid
+from datetime import datetime
+from dotenv import load_dotenv
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import current_timestamp, col
+from pyspark.sql.types import StructType, StructField, StringType, MapType
+
+# 1. CHARGEMENT DES IDENTIFIANTS (Depuis le fichier .env)
+load_dotenv()
+STARBURST_USER = os.getenv("USER")
+STARBURST_PASS = os.getenv("PASSWORD")
+
+# Vérification rapide de sécurité
+if not STARBURST_USER or not STARBURST_PASS:
+    raise ValueError("Erreur : USER ou PASSWORD introuvable dans les variables d'environnement.")
+
+# ==========================================
+# CONFIGURATION JDBC & S3
+# ==========================================
+# Ta véritable URL interne sécurisée (SSL=true)
+STARBURST_JDBC_URL = "jdbc:trino://starburst-ap26761-dev-05b792a6.data.cloud.net.intra:443/dh_poc_ice?SSL=true"
+S3_RAW_PATH = "s3a://bu002i004226/poc_streaming/input_cloudevent_raw/"
+
+# ==========================================
+# 2. INITIALISATION SPARK (Avec le Driver Trino)
+# ==========================================
+# L'option "spark.jars.packages" est cruciale : elle dit à Spark de télécharger 
+# le connecteur Java Trino/Starburst tout seul au démarrage.
+spark = SparkSession.builder \
+    .appName("PoC-BNPP-Streaming-To-Starburst") \
+    .config("spark.sql.shuffle.partitions", "16") \
+    .config("spark.jars.packages", "io.trino:trino-jdbc:435") \
+    .getOrCreate()
+
+spark.sparkContext.setLogLevel("WARN")
+
+schema_events = StructType([
+    StructField("id", StringType(), True),
+    StructField("time", StringType(), True),
+    StructField("dh_poc_gen_timestamp", StringType(), True)
+])
+
+# ==========================================
+# 3. GÉNÉRATEUR (Tâche de fond)
+# ==========================================
+def generate_events():
+    print("### [GÉNÉRATEUR] Démarrage de l'envoi des données vers S3 Raw... ###")
+    for batch in range(1, 10): # 9 vagues pour le test
+        mock_data = [(str(uuid.uuid4()), datetime.utcnow().isoformat()+"Z", datetime.utcnow().isoformat()+"Z")]
+        df_gen = spark.createDataFrame(mock_data, schema=schema_events)
+        df_gen.write.mode("append").json(S3_RAW_PATH)
+        time.sleep(5)
+    print("### [GÉNÉRATEUR] Fin de l'envoi. ###")
+
+threading.Thread(target=generate_events, daemon=True).start()
+
+# Laisse le temps au générateur de créer les premiers dossiers sur S3
+time.sleep(10) 
+
+# ==========================================
+# 4. STREAMING : LECTURE S3 -> PUSH JDBC STARBURST
+# ==========================================
+print("### DÉMARRAGE DU STREAMING : SPARK -> JDBC -> STARBURST -> ICEBERG ###")
+
+df_stream = spark.readStream.format("json").schema(schema_events).load(S3_RAW_PATH)
+
+# Ajout du T3 (Moment où Spark traite la donnée en mémoire)
+df_processed = df_stream.select(
+    col("id"),
+    col("time"), # T1
+    col("dh_poc_gen_timestamp"), # T2
+    current_timestamp().cast("timestamp").alias("dh_poc_spark_read_timestamp") # T3
+)
+
+# Fonction d'écriture JDBC par micro-batch
+def push_to_starburst(df, batch_id):
+    # .repartition(16) force 16 connexions simultanées vers Starburst
+    df.repartition(16).write \
+        .format("jdbc") \
+        .option("url", STARBURST_JDBC_URL) \
+        .option("dbtable", "pocspark.cloudevent_direct") \
+        .option("user", STARBURST_USER) \
+        .option("password", STARBURST_PASS) \
+        .option("driver", "io.trino.jdbc.TrinoDriver") \
+        .mode("append") \
+        .save()
+
+query = df_processed.writeStream \
+    .foreachBatch(push_to_starburst) \
+    .trigger(processingTime="2 seconds") \
+    .start()
+
+query.awaitTermination()
+```
+
+---
+
+### Rappel de la table cible (À créer une seule fois dans Starburst)
+
+Pour que ce code fonctionne parfaitement et que tu puisses mesurer ta latence de bout en bout, assure-toi d'avoir créé cette table au préalable dans l'interface Starburst. Le `DEFAULT CURRENT_TIMESTAMP` est ce qui te donnera ton vrai **T4**.
+
+```sql
+CREATE TABLE IF NOT EXISTS dh_poc_ice.pocspark.cloudevent_direct (
+    id VARCHAR,
+    time VARCHAR, -- T1
+    dh_poc_gen_timestamp VARCHAR, -- T2
+    dh_poc_spark_read_timestamp TIMESTAMP(3), -- T3
+    dh_poc_starburst_receive_timestamp TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP -- T4
+)
+WITH (
+    format = 'PARQUET',
+    location = 's3a://bu002i004226/poc_streaming/cloudevent/'
+);
+```
+
+
 C'est une excellente correction. Ton analyse est tout à fait juste : dans le schéma précédent, **Spark** court-circuitait **Starburst** en écrivant directement les fichiers dans l'entrepôt (le COS). C'est pour cela que la table Iceberg restait "aveugle" : elle n'était pas au courant que de nouveaux fichiers avaient été déposés par un tiers.
 
 En passant sur une architecture **"Push JDBC"**, on rétablit la hiérarchie :
