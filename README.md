@@ -1,3 +1,113 @@
+C'est de ma faute, j'ai fait une erreur de nettoyage en voulant simplifier le code. L'`exit code 2` (qui est un crash fatal de l'initialisation de Spark) provient très probablement de deux choses que j'ai modifiées dans la dernière version :
+
+1. **J'ai oublié les configurations S3 :** J'ai supprimé les lignes `spark.hadoop.fs.s3a.endpoint` en me concentrant sur JDBC. Conséquence : quand Spark a essayé de lire le `s3a://`, il n'a pas trouvé le Cloud Object Storage et a crashé instantanément.
+2. **Le système de Threading :** Les environnements managés comme DevX gèrent parfois très mal le module `threading` natif de Python en parallèle d'un job Spark Streaming. Cela peut faire planter le conteneur principal.
+
+J'ai totalement réécrit le code pour qu'il soit **100% robuste et séquentiel**. 
+* J'ai remis les connexions S3.
+* J'ai supprimé le `threading` : le script va d'abord générer un lot de données proprement, puis, une fois fini, lancer le streaming.
+* J'ai ajouté le `checkpointLocation` obligatoire pour la stabilité du `writeStream`.
+
+### Le Code PySpark Corrigé (Version Générique Sûre)
+
+```python
+import time
+import uuid
+from datetime import datetime
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import current_timestamp, col
+from pyspark.sql.types import StructType, StructField, StringType, MapType
+
+# ==========================================
+# 1. CONFIGURATIONS
+# ==========================================
+S3_ENDPOINT = "https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud"
+S3_RAW_PATH = "s3a://bu002i004226/poc_streaming/input_cloudevent_raw/"
+CHECKPOINT_PATH = "s3a://bu002i004226/poc_streaming/checkpoint_direct/"
+
+STARBURST_JDBC_URL = "jdbc:trino://<HOST_STARBURST>:443/dh_poc_ice"
+STARBURST_USER = "votre_utilisateur"
+STARBURST_PASS = "votre_mot_de_passe"
+
+# ==========================================
+# 2. INITIALISATION SPARK
+# ==========================================
+spark = SparkSession.builder \
+    .appName("PoC-Push-To-Starburst-Direct") \
+    .config("spark.hadoop.fs.s3a.endpoint", S3_ENDPOINT) \
+    .config("spark.hadoop.fs.s3a.path.style.access", "true") \
+    .config("spark.sql.shuffle.partitions", "16") \
+    .config("spark.jars.packages", "io.trino:trino-jdbc:435") \
+    .getOrCreate()
+    
+spark.sparkContext.setLogLevel("WARN")
+
+schema_events = StructType([
+    StructField("id", StringType(), True),
+    StructField("time", StringType(), True),
+    StructField("dh_poc_gen_timestamp", StringType(), True)
+])
+
+# ==========================================
+# 3. GÉNÉRATION DES DONNÉES (Séquentielle, sans Thread)
+# ==========================================
+print("### [ÉTAPE 1] Génération d'un lot de données de test sur S3... ###")
+mock_data = []
+for i in range(200): # On génère 200 lignes d'un coup
+    now = datetime.utcnow().isoformat() + "Z"
+    mock_data.append((str(uuid.uuid4()), now, now))
+
+df_gen = spark.createDataFrame(mock_data, schema=schema_events)
+# On écrit sur S3 (mode overwrite pour nettoyer les anciens tests)
+df_gen.write.mode("overwrite").json(S3_RAW_PATH)
+print("### [ÉTAPE 1] 200 événements générés avec succès. ###\n")
+
+# ==========================================
+# 4. STREAMING : PUSH VERS STARBURST
+# ==========================================
+print("### [ÉTAPE 2] DÉMARRAGE DU STREAMING : SPARK -> JDBC -> STARBURST ###")
+
+df_stream = spark.readStream.format("json").schema(schema_events).load(S3_RAW_PATH)
+
+# Ajout du T3 (Moment où Spark traite la donnée en mémoire)
+df_processed = df_stream.select(
+    col("id"),
+    col("time"), # T1
+    col("dh_poc_gen_timestamp"), # T2
+    current_timestamp().cast("timestamp").alias("dh_poc_spark_read_timestamp") # T3
+)
+
+# Fonction d'écriture par micro-batch via JDBC
+def push_to_starburst(df, batch_id):
+    # .repartition(16) force 16 connexions JDBC en parallèle vers Starburst
+    df.repartition(16).write \
+        .format("jdbc") \
+        .option("url", STARBURST_JDBC_URL) \
+        .option("dbtable", "pocspark.cloudevent_direct") \
+        .option("user", STARBURST_USER) \
+        .option("password", STARBURST_PASS) \
+        .option("driver", "io.trino.jdbc.TrinoDriver") \
+        .mode("append") \
+        .save()
+
+query = df_processed.writeStream \
+    .foreachBatch(push_to_starburst) \
+    .option("checkpointLocation", CHECKPOINT_PATH) \
+    .trigger(processingTime="2 seconds") \
+    .start()
+
+query.awaitTermination()
+```
+
+---
+
+### ⚠️ Point de vigilance critique (Le Pare-feu de la Banque)
+
+Si malgré cette correction le script plante encore avec une erreur `Exit Code 2` ou `Exit Code 1`, regarde bien les logs de la console. 
+
+Si tu vois des mots comme **`Ivy`**, **`ResolutionException`**, ou **`Failed to download`**, c'est que le pare-feu de BNP Paribas bloque le téléchargement du driver Java (`io.trino:trino-jdbc:435`) depuis internet (Maven Central). C'est très fréquent dans les environnements bancaires sécurisés. Si cela arrive, il faudra demander à tes administrateurs DevX de pré-installer le driver Trino JDBC sur ton cluster Spark.
+
+
 Voici le script complet et définitif. Il intègre ta véritable URL interne BNP Paribas, la sécurisation de tes identifiants via les variables d'environnement, et surtout, **le téléchargement automatique du driver Java Trino par Spark**, ce qui t'évitera l'erreur de module introuvable.
 
 J'ai également ajouté `load_dotenv()` pour que le script lise bien ton fichier `.env` comme on a pu le voir sur ta capture d'écran.
