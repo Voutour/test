@@ -1,3 +1,59 @@
+Le fait que ça ait "un peu run" (tourné quelques instants) avant de planter est en réalité une **excellente nouvelle** ! Cela prouve que ton réseau est ouvert, que tes identifiants sont bons, que le driver JDBC est bien téléchargé et que Spark arrive à parler à Starburst. On a passé le plus dur.
+
+Quand un flux JDBC plante après quelques secondes de fonctionnement normal, c'est presque toujours dû à un problème de "rythme" ou de "charge". 
+
+Voici les deux coupables les plus probables et comment blinder le code pour les éviter.
+
+### 1. Le Syndrome du "Batch Vide" (Coupable n°1)
+Dans Spark Streaming, quand le générateur a fini d'envoyer ses données, le flux continue de tourner toutes les 2 secondes. Il va donc essayer d'envoyer des DataFrames **vides** vers Starburst. Le driver JDBC de Trino déteste ça et va souvent crasher avec une erreur SQL obscure car il essaie de faire un `INSERT` sans aucune ligne.
+
+### 2. L'Attaque DDoS involontaire (Coupable n°2)
+On a été très agressifs avec notre configuration "Formule 1" : un `trigger` toutes les 2 secondes avec 16 connexions simultanées (`repartition(16)`). Il est fort possible que le cluster Starburst de BNP Paribas t'ait coupé la connexion en pensant subir une attaque par déni de service, ou que son "Connection Pool" ait saturé.
+
+---
+
+### La Solution : Le code de l'amortisseur
+
+Il suffit de modifier uniquement ta fonction `push_to_starburst` et ton `writeStream` pour ajouter un "videur à l'entrée" (qui bloque les batchs vides) et relâcher un peu la pression sur le serveur.
+
+Remplace la fin de ton script par ceci :
+
+```python
+# Fonction d'écriture par micro-batch via JDBC
+def push_to_starburst(df, batch_id):
+    
+    # SÉCURITÉ 1 : On vérifie s'il y a de la donnée avant de déranger Starburst
+    if not df.isEmpty():
+        print(f"### Envoi du batch {batch_id} en cours... ###")
+        
+        # SÉCURITÉ 2 : On réduit à 4 partitions (4 connexions) pour ne pas saturer Starburst
+        try:
+            df.repartition(4).write \
+                .format("jdbc") \
+                .option("url", STARBURST_JDBC_URL) \
+                .option("dbtable", "pocspark.cloudevent_direct") \
+                .option("user", STARBURST_USER) \
+                .option("password", STARBURST_PASS) \
+                .option("driver", "io.trino.jdbc.TrinoDriver") \
+                .mode("append") \
+                .save()
+            print(f"### Batch {batch_id} inséré avec succès ! ###")
+        except Exception as e:
+            print(f"Erreur fatale sur le batch {batch_id} : {e}")
+
+query = df_processed.writeStream \
+    .foreachBatch(push_to_starburst) \
+    .option("checkpointLocation", CHECKPOINT_PATH) \
+    .trigger(processingTime="10 seconds") # SÉCURITÉ 3 : On respire. 10 secondes au lieu de 2.
+    .start()
+
+query.awaitTermination()
+```
+
+Relance avec cette configuration plus "douce". 
+
+Si ça coupe encore, pourrais-tu regarder dans les logs d'erreur (la longue liste rouge qui s'affiche quand ça plante) et me dire si tu vois les mots **"Timeout"**, **"Connection Refused"** ou une erreur SQL spécifique venant de **"Trino"** ?
+
 C'est de ma faute, j'ai fait une erreur de nettoyage en voulant simplifier le code. L'`exit code 2` (qui est un crash fatal de l'initialisation de Spark) provient très probablement de deux choses que j'ai modifiées dans la dernière version :
 
 1. **J'ai oublié les configurations S3 :** J'ai supprimé les lignes `spark.hadoop.fs.s3a.endpoint` en me concentrant sur JDBC. Conséquence : quand Spark a essayé de lire le `s3a://`, il n'a pas trouvé le Cloud Object Storage et a crashé instantanément.
