@@ -1,3 +1,152 @@
+C'est une excellente correction. Ton analyse est tout à fait juste : dans le schéma précédent, **Spark** court-circuitait **Starburst** en écrivant directement les fichiers dans l'entrepôt (le COS). C'est pour cela que la table Iceberg restait "aveugle" : elle n'était pas au courant que de nouveaux fichiers avaient été déposés par un tiers.
+
+En passant sur une architecture **"Push JDBC"**, on rétablit la hiérarchie :
+1. **Spark** est le moteur de traitement (il prépare la donnée).
+2. **Spark** envoie un ordre `INSERT` SQL à **Starburst**.
+3. **Starburst** reçoit l'ordre, génère lui-même les fichiers dans le COS et met à jour ses métadonnées Iceberg instantanément.
+
+C'est la garantie d'une visibilité atomique et immédiate. Voici le dispositif complet mis à jour.
+
+### 1. Création de la Table cible (Côté Starburst)
+
+Exécute d'abord ce SQL dans Starburst. Note l'utilisation du `DEFAULT CURRENT_TIMESTAMP` pour la colonne **T4** : c'est Starburst qui marquera lui-même l'heure de réception, ce qui nous donnera un T4 enfin différent du T3 de Spark.
+
+```sql
+-- À exécuter dans Starburst
+CREATE TABLE IF NOT EXISTS dh_poc_ice.pocspark.cloudevent_direct (
+    id VARCHAR,
+    time VARCHAR, -- T1
+    dh_poc_gen_timestamp VARCHAR, -- T2
+    dh_poc_spark_read_timestamp TIMESTAMP(3), -- T3
+    -- T4 : Starburst remplira cette colonne automatiquement au moment de l'INSERT SQL
+    dh_poc_starburst_receive_timestamp TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP
+)
+WITH (
+    format = 'PARQUET',
+    location = 's3a://bu002i004226/poc_streaming/cloudevent/'
+);
+```
+
+---
+
+### 2. Code PySpark "Push Direct" (`main_cloudevent.py`)
+
+Ce code n'utilise plus les configurations Iceberg natives de Spark (qui écrivaient sur S3). Il utilise le **connecteur JDBC** pour parler directement à Starburst.
+
+```python
+import threading
+import time
+import uuid
+from datetime import datetime
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import current_timestamp, col, to_json
+from pyspark.sql.types import StructType, StructField, StringType, MapType
+
+# ==========================================
+# CONFIGURATION JDBC & S3
+# ==========================================
+# Remplace par tes vrais identifiants Starburst
+STARBURST_JDBC_URL = "jdbc:trino://<HOST_STARBURST>:443/dh_poc_ice"
+STARBURST_USER = "votre_utilisateur"
+STARBURST_PASS = "votre_mot_de_passe"
+
+S3_RAW_PATH = "s3a://bu002i004226/poc_streaming/input_cloudevent_raw/"
+
+# 1. INITIALISATION SPARK
+spark = SparkSession.builder \
+    .appName("PoC-Push-To-Starburst-Direct") \
+    .config("spark.sql.shuffle.partitions", "16") \
+    .getOrCreate()
+spark.sparkContext.setLogLevel("WARN")
+
+# Schéma JSON d'entrée
+schema_events = StructType([
+    StructField("id", StringType(), True),
+    StructField("time", StringType(), True),
+    StructField("dh_poc_gen_timestamp", StringType(), True)
+])
+
+# ==========================================
+# 2. GÉNÉRATEUR (Toujours utile pour le test)
+# ==========================================
+def generate_events():
+    for batch in range(1, 6):
+        mock_data = [(str(uuid.uuid4()), datetime.utcnow().isoformat()+"Z", datetime.utcnow().isoformat()+"Z")]
+        df_gen = spark.createDataFrame(mock_data, schema=schema_events)
+        df_gen.write.mode("append").json(S3_RAW_PATH)
+        time.sleep(5)
+
+threading.Thread(target=generate_events, daemon=True).start()
+
+# ==========================================
+# 3. STREAMING : PUSH VERS STARBURST
+# ==========================================
+print("### DÉMARRAGE DU FLUX : SPARK -> JDBC -> STARBURST -> ICEBERG ###")
+
+df_stream = spark.readStream.format("json").schema(schema_events).load(S3_RAW_PATH)
+
+# Ajout du T3 (Moment où Spark traite la donnée)
+df_processed = df_stream.select(
+    col("id"),
+    col("time"), # T1
+    col("dh_poc_gen_timestamp"), # T2
+    current_timestamp().cast("timestamp").alias("dh_poc_spark_read_timestamp") # T3
+)
+
+# Fonction d'écriture par micro-batch via JDBC
+def push_to_starburst(df, batch_id):
+    # On force 16 partitions pour ouvrir 16 connexions JDBC en parallèle vers Starburst
+    df.repartition(16).write \
+        .format("jdbc") \
+        .option("url", STARBURST_JDBC_URL) \
+        .option("dbtable", "pocspark.cloudevent_direct") \
+        .option("user", STARBURST_USER) \
+        .option("password", STARBURST_PASS) \
+        .option("driver", "io.trino.jdbc.TrinoDriver") \
+        .mode("append") \
+        .save()
+
+query = df_processed.writeStream \
+    .foreachBatch(push_to_starburst) \
+    .trigger(processingTime="2 seconds") \
+    .start()
+
+query.awaitTermination()
+```
+
+---
+
+### Pourquoi cette architecture est la "bonne" pour ton schéma :
+
+1. **Visibilité Instantanée :** Comme c'est Starburst qui fait l'`INSERT`, il met à jour ses métadonnées Iceberg en même temps qu'il écrit le fichier. Il n'y a plus aucun délai entre l'écriture et la lecture.
+2. **Le vrai T4 :** En définissant la colonne T4 avec `DEFAULT CURRENT_TIMESTAMP` dans Starburst, tu captures l'heure exacte à laquelle Starburst a validé la transaction SQL.
+3. **Parallélisme conservé :** Le `repartition(16)` avant l'écriture JDBC garantit que tes 16 cœurs travaillent ensemble pour "pousser" les données vers Starburst.
+
+
+
+### Visualisation de la Latence du modèle "Push"
+
+Ce widget te permet de simuler et de comprendre comment les 4 timestamps vont se comporter dans cette nouvelle architecture. Tu verras que le "saut" entre T3 et T4 représente maintenant le temps de trajet JDBC et le commit Starburst.
+
+```json?chameleon
+{"component":"LlmGeneratedComponent","props":{"height":"700px","prompt":"Objectif : Simuler et visualiser la latence du modèle 'Push JDBC' (Spark vers Starburst). \nInitialValues : t1_t2: 150, t2_t3: 1500, t3_t4: 400. \nStrategy : Standard Layout. \nInputs : \n- Curseur 'Latence Réseau S3 Raw (ms)' (T1-T2)\n- Curseur 'Intervalle Trigger Spark (sec)' (T2-T3)\n- Curseur 'Temps de réponse JDBC Starburst (ms)' (T3-T4)\nBehavior : \n- Afficher un flux animé : Evénement -> S3 Raw -> Spark -> Starburst -> Iceberg/COS.\n- Calculer les 4 timestamps (T1 à T4) en temps réel. \n- Afficher un tableau de résultats type SQL Starburst montrant les colonnes ID, T1, T2, T3, T4. \n- Mettre en évidence que T4 (Starburst Receive) est maintenant supérieur à T3 (Spark Read) de quelques centaines de millisecondes, prouvant le temps de traitement SQL.\n- Afficher une jauge de 'Fraîcheur de la donnée' (Data Freshness). Langue : Français.","id":"im_d116b0e2fdc94b3a"}}
+```
+
+### Comment vérifier les résultats ?
+
+Une fois le code lancé, fais un simple `SELECT` dans Starburst :
+```sql
+SELECT 
+    id, 
+    to_milliseconds(dh_poc_starburst_receive_timestamp - dh_poc_spark_read_timestamp) as ms_push_latency
+FROM dh_poc_ice.pocspark.cloudevent_direct
+ORDER BY dh_poc_starburst_receive_timestamp DESC;
+```
+Tu verras enfin une différence positive entre T3 et T4, ce qui validera la performance de ta nouvelle architecture "Push". 
+
+Es-tu prêt à tester la connexion JDBC avec tes identifiants ?
+
+
 C'est l'explication que nous attendions ! Tout s'éclaire : le problème n'était pas ton code, mais une **erreur d'aiguillage architectural**.
 
 Dans tes tests précédents, Spark se comportait comme un "intrus" : il déposait des fichiers directement sur le stockage (COS) dans le dos de Starburst. Comme Starburst est le "gardien" du catalogue Iceberg, il ne voyait pas ces nouveaux fichiers arriver.
