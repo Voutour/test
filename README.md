@@ -1,22 +1,11 @@
-Bien vu ! C'est la preuve ultime que fouiller dans la documentation interne (Confluence) est toujours la meilleure solution. Et c'est une excellente nouvelle : ton équipe infrastructure a bien fait son travail.
+Bien sûr, c'est tout à fait possible. Si tu n'utilises pas de fichier `.env`, il te suffit de définir tes identifiants directement dans le code sous forme de texte (en "dur").
 
-Si le driver est "déjà installé dans le cluster Spark", alors **pourquoi as-tu eu l'erreur `ClassNotFoundException` juste avant ?**
-
-C'est très probablement à cause de la commande que je t'ai fait ajouter : `.config("spark.jars.packages", "io.trino:trino-jdbc:435")`.
-En forçant cette configuration, Spark a cru qu'il *devait* aller le télécharger sur internet via son gestionnaire de paquets (Ivy). Quand le pare-feu l'a bloqué, Spark a paniqué et a crashé, sans même prendre la peine de regarder dans ses propres dossiers locaux s'il l'avait déjà !
-
-### La Solution : Nettoyer l'initialisation
-
-Puisque le cluster possède déjà le driver en natif, on ne demande plus rien à Spark. On le laisse démarrer normalement, et on fait simplement appel au connecteur JDBC.
-
-Voici le code nettoyé. J'ai retiré toutes les options de `.jars` ou `.packages`.
+Voici le code épuré de toute la logique `dotenv`. Il te suffit de remplacer `"ton_identifiant"` et `"ton_mot_de_passe"` par tes vraies valeurs avant de le lancer.
 
 ```python
 import time
 import uuid
-import os
 from datetime import datetime
-from dotenv import load_dotenv
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import current_timestamp, col
 from pyspark.sql.types import StructType, StructField, StringType, MapType
@@ -24,9 +13,9 @@ from pyspark.sql.types import StructType, StructField, StringType, MapType
 # ==========================================
 # 1. CONFIGURATIONS
 # ==========================================
-load_dotenv()
-STARBURST_USER = os.getenv("USER")
-STARBURST_PASS = os.getenv("PASSWORD")
+# Mets tes identifiants directement ici
+STARBURST_USER = "ton_identifiant"
+STARBURST_PASS = "ton_mot_de_passe"
 
 S3_ENDPOINT = "https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud"
 S3_RAW_PATH = "s3a://bu002i004226/poc_streaming/input_cloudevent_raw/"
@@ -37,9 +26,8 @@ CHECKPOINT_PATH = f"s3a://bu002i004226/poc_streaming/checkpoint_direct_{run_id}/
 STARBURST_JDBC_URL = "jdbc:trino://starburst-ap26761-dev-05b792a6.data.cloud.net.intra:443/dh_poc_ice?SSL=true"
 
 # ==========================================
-# 2. INITIALISATION SPARK (Épurée)
+# 2. INITIALISATION SPARK
 # ==========================================
-# On retire toute mention aux JARS. On fait confiance au cluster BNPP.
 spark = SparkSession.builder \
     .appName("PoC-Push-To-Starburst-Direct") \
     .config("spark.hadoop.fs.s3a.endpoint", S3_ENDPOINT) \
@@ -89,7 +77,7 @@ def push_to_starburst(df, batch_id):
             df.repartition(2).write \
                 .format("jdbc") \
                 .option("url", STARBURST_JDBC_URL) \
-                .option("dbtable", "pocspark.cloudevent_direct") \
+                .option("dbtable", "dh_poc_ice.pocspark.cloudevent_direct") \
                 .option("user", STARBURST_USER) \
                 .option("password", STARBURST_PASS) \
                 .option("driver", "io.trino.jdbc.TrinoDriver") \
