@@ -1,3 +1,138 @@
+C'est la phase finale et la plus gratifiante ! Tester une orchestration Airflow, c'est comme regarder les dominos tomber : on appuie sur un seul bouton et tout s'enchaîne.
+
+Puisque tu es dans un environnement d'entreprise structuré, on ne teste pas directement en production. Voici le plan de test pas-à-pas pour valider ton pipeline de bout en bout.
+
+### Étape 1 : Préparer le terrain (Les fichiers)
+Avant de toucher à Airflow, il faut que tes fichiers soient à leur place définitive.
+1. **Le Script Spark :** Prends le dernier code hybride Python/Spark qu'on a fait (sans les fausses données générées, juste le `readStream` et le `writeStream`). Uploade ce fichier `.py` sur ton Cloud Object Storage (S3), par exemple dans un dossier `s3a://bu002i004226/poc_streaming/scripts/`.
+2. **Le DAG Airflow :** Prends le code Python du DAG (celui avec `SimpleHttpOperator`) et dépose-le dans le dossier `dags/` de ton environnement Airflow (souvent géré via un dépôt Git ou une interface d'upload).
+
+### Étape 2 : Configurer la tuyauterie (Dans Airflow)
+Airflow a besoin de savoir comment parler à ton cluster Spark.
+1. Ouvre l'interface web de ton **Airflow**.
+2. Va dans le menu en haut : **Admin -> Connections**.
+3. Clique sur le bouton **"+"** pour ajouter une connexion :
+   * **Conn Id :** `connexion_api_sparktacus` *(doit être exactement le nom mis dans ton code DAG)*.
+   * **Conn Type :** `HTTP`.
+   * **Host :** L'URL de l'API de ton cluster (ex: `https://sparktacus.cloud.intra`).
+   * **Login / Password :** Tes identifiants ou le token d'API fourni par ton équipe.
+4. Sauvegarde.
+
+### Étape 3 : Le test grandeur nature (Le bouton "Play")
+C'est le moment de vérité.
+1. Retourne sur la page d'accueil d'Airflow (le tableau de bord des DAGs).
+2. Cherche ton DAG : `deploy_sparktacus_streaming_api`.
+3. Active-le (en basculant le petit interrupteur sur **"On"** ou **"Unpause"**).
+4. Clique sur le bouton **"Trigger DAG"** (le bouton "Play" ▷).
+
+### Étape 4 : Le Monitoring (Où regarder ?)
+Pendant que ça tourne, voici comment suivre l'exécution :
+1. **Dans Airflow :** Clique sur la tâche en cours d'exécution et ouvre l'onglet **"Logs"**. Tu y verras la réponse de l'API (ex: *"Job 142 submitted successfully"*).
+2. **Dans la console Spark (Livy/DevX) :** Si tu as accès à l'interface de monitoring de ton cluster Spark, tu devrais voir ton job s'afficher au statut "Running".
+3. **Le test Ultime (Dans Starburst) :** Ouvre l'interface de Starburst et lance la fameuse requête de latence :
+   ```sql
+   SELECT id, dh_poc_spark_read_timestamp, dh_poc_starburst_receive_timestamp 
+   FROM dh_poc_ice.pocspark.cloudevent_direct 
+   ORDER BY dh_poc_starburst_receive_timestamp DESC LIMIT 10;
+   ```
+
+Si des lignes s'affichent et s'actualisent, félicitations, ton architecture CTDF est opérationnelle de bout en bout !
+
+**Une question cruciale pour ton déploiement :** Dans ton entreprise, as-tu le droit de glisser-déposer ton fichier DAG directement dans l'interface Airflow, ou dois-tu obligatoirement le *commiter* sur un dépôt Gitlab/Bitbucket pour qu'un pipeline CI/CD le déploie à ta place ?
+
+
+Merci pour le schéma ! Il est extrêmement clair et nous donne la "Big Picture" de ton projet (l'architecture CTDF). 
+
+Ce schéma valide d'ailleurs à 100 % ce que nous venons de construire ensemble. Regarde bien la flèche en pointillés qui part de la boîte **Sparktacus** vers la boîte **Refined Data storage [Starburst]** : il est explicitement écrit **"SQL insert"**. Ton script hybride Spark/Trino est donc en parfaite adéquation avec la vision des architectes !
+
+Maintenant, décortiquons comment **Apache Airflow** et les **APIs** s'intègrent dans ce schéma précis. Il y a souvent une confusion entre l'API qui reçoit la donnée et l'API qui lance le code.
+
+### 1. Ne pas confondre les deux APIs du schéma
+
+Sur ton schéma, la mention **"Mediation API POST Generic Event"** tout à gauche n'a rien à voir avec Airflow. 
+* C'est la porte d'entrée des données. En production, tu vas supprimer notre petite fonction Python `generate_events()`. À la place, ce sont les applications métier (Source A) qui vont faire des requêtes HTTP POST vers cette API Mediation pour y déposer les JSON.
+* **Le travail d'Airflow ne se situe pas ici.**
+
+### 2. Le vrai rôle d'Airflow (Gérer "Sparktacus")
+
+Ton script (le Stream Spark) s'exécute dans la zone **Sparktacus** (en bas).
+Puisque le schéma indique un **"TARGET : En moins d'une minute"**, ton script est un job de **Streaming continu** (il ne s'arrête jamais). 
+
+Airflow n'est pas fait pour faire tourner du streaming en son sein. Son rôle va être d'agir comme un **Superviseur via l'API du cluster Spark**. Airflow va dire au cluster : *"Voici le script Sparktacus, lance-le. S'il plante, je le relancerai."*
+
+### 3. Le Code Airflow (Le DAG de déploiement)
+
+Pour lancer ton script via Airflow, on utilise l'API de ton cluster (généralement Apache Livy sur les environnements Hadoop/Cloud). Airflow va faire une requête HTTP POST (API) vers le cluster pour soumettre le script Python que tu auras déposé sur le COS.
+
+Voici le DAG Airflow type à implémenter pour orchestrer ton script Sparktacus :
+
+```python
+from airflow import DAG
+from airflow.providers.http.operators.http import SimpleHttpOperator
+from datetime import datetime, timedelta
+import json
+
+# ==========================================
+# 1. CONFIGURATION DU DAG AIRFLOW
+# ==========================================
+default_args = {
+    'owner': 'equipe_data_ctdf',
+    'depends_on_past': False,
+    'email_on_failure': True, # Alerte si le stream plante
+    'retries': 3, # On essaie de relancer 3 fois en cas de crash
+    'retry_delay': timedelta(minutes=2),
+}
+
+# Un DAG de supervision : il vérifie l'état une fois par jour ou se déclenche manuellement
+dag = DAG(
+    'deploy_sparktacus_streaming_api',
+    default_args=default_args,
+    description='Déploie le script Sparktacus (Push vers Starburst) via API',
+    schedule_interval='@daily', 
+    start_date=datetime(2026, 4, 21),
+    catchup=False,
+)
+
+# ==========================================
+# 2. LE PAYLOAD POUR L'API SPARK (Livy)
+# ==========================================
+# C'est ici qu'on indique à l'API quel script exécuter
+spark_livy_payload = {
+    # Le chemin de ton script Python final stocké sur le COS (S3)
+    "file": "s3a://bu002i004226/poc_streaming/scripts/main_cloudevent.py",
+    "name": "Sparktacus-Streaming-To-Starburst",
+    "conf": {
+        "spark.sql.shuffle.partitions": "4",
+        "spark.hadoop.fs.s3a.endpoint": "https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud",
+        "spark.hadoop.fs.s3a.path.style.access": "true"
+    }
+}
+
+# ==========================================
+# 3. L'APPEL API (La tâche Airflow)
+# ==========================================
+# Airflow fait un POST vers l'API de ton cluster pour démarrer le job
+lancer_job_spark = SimpleHttpOperator(
+    task_id='trigger_spark_via_api',
+    http_conn_id='connexion_api_sparktacus', # La connexion définie dans l'interface Airflow (URL + Token)
+    endpoint='/batches', # L'endpoint standard de soumission
+    method='POST',
+    data=json.dumps(spark_livy_payload),
+    headers={"Content-Type": "application/json"},
+    dag=dag,
+)
+
+lancer_job_spark
+```
+
+### Ce qu'il te reste à préparer pour l'industrialisation :
+
+1. **Nettoyer ton code actuel :** Retire toute la partie de génération de données (le `mock_data`). Ton script doit uniquement faire la lecture (`readStream`) et l'écriture (`push_to_starburst_via_python`).
+2. **Uploader le script :** Dépose ce fichier `.py` propre dans un dossier de ton COS (par exemple `s3a://bu002i004226/poc_streaming/scripts/`).
+3. **Créer la connexion dans Airflow :** Dans l'interface web de ton Airflow d'entreprise, ajoute une connexion nommée `connexion_api_sparktacus` avec l'URL de l'API de ton cluster Spark et les identifiants techniques.
+
+
+
 Passer de l'environnement de développement (DevX / Notebook) à **Apache Airflow**, c'est exactement la démarche à suivre pour industrialiser ton PoC et le mettre en production.
 
 Cependant, il y a un point architectural crucial à comprendre avant d'écrire le code : **Airflow est un chef d'orchestre, pas un ouvrier.**
