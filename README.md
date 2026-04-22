@@ -1,246 +1,10 @@
-C'est la phase finale et la plus gratifiante ! Tester une orchestration Airflow, c'est comme regarder les dominos tomber : on appuie sur un seul bouton et tout s'enchaîne.
+C'est la décision la plus sage et la plus pragmatique. Dans les environnements bancaires très verrouillés, il faut savoir s'adapter aux portes qui sont ouvertes plutôt que de s'acharner sur celles qui sont fermées par la sécurité !
 
-Puisque tu es dans un environnement d'entreprise structuré, on ne teste pas directement en production. Voici le plan de test pas-à-pas pour valider ton pipeline de bout en bout.
+Avec cette version "Hybride REST", tu contournes totalement le problème de Java, du `.jar` introuvable et du pare-feu. C'est du pur Python qui parle à l'API de Starburst.
 
-### Étape 1 : Préparer le terrain (Les fichiers)
-Avant de toucher à Airflow, il faut que tes fichiers soient à leur place définitive.
-1. **Le Script Spark :** Prends le dernier code hybride Python/Spark qu'on a fait (sans les fausses données générées, juste le `readStream` et le `writeStream`). Uploade ce fichier `.py` sur ton Cloud Object Storage (S3), par exemple dans un dossier `s3a://bu002i004226/poc_streaming/scripts/`.
-2. **Le DAG Airflow :** Prends le code Python du DAG (celui avec `SimpleHttpOperator`) et dépose-le dans le dossier `dags/` de ton environnement Airflow (souvent géré via un dépôt Git ou une interface d'upload).
+Voici le code final, propre, fonctionnel et **sans `dotenv`**. Tu as juste à insérer ton identifiant à la ligne 12.
 
-### Étape 2 : Configurer la tuyauterie (Dans Airflow)
-Airflow a besoin de savoir comment parler à ton cluster Spark.
-1. Ouvre l'interface web de ton **Airflow**.
-2. Va dans le menu en haut : **Admin -> Connections**.
-3. Clique sur le bouton **"+"** pour ajouter une connexion :
-   * **Conn Id :** `connexion_api_sparktacus` *(doit être exactement le nom mis dans ton code DAG)*.
-   * **Conn Type :** `HTTP`.
-   * **Host :** L'URL de l'API de ton cluster (ex: `https://sparktacus.cloud.intra`).
-   * **Login / Password :** Tes identifiants ou le token d'API fourni par ton équipe.
-4. Sauvegarde.
-
-### Étape 3 : Le test grandeur nature (Le bouton "Play")
-C'est le moment de vérité.
-1. Retourne sur la page d'accueil d'Airflow (le tableau de bord des DAGs).
-2. Cherche ton DAG : `deploy_sparktacus_streaming_api`.
-3. Active-le (en basculant le petit interrupteur sur **"On"** ou **"Unpause"**).
-4. Clique sur le bouton **"Trigger DAG"** (le bouton "Play" ▷).
-
-### Étape 4 : Le Monitoring (Où regarder ?)
-Pendant que ça tourne, voici comment suivre l'exécution :
-1. **Dans Airflow :** Clique sur la tâche en cours d'exécution et ouvre l'onglet **"Logs"**. Tu y verras la réponse de l'API (ex: *"Job 142 submitted successfully"*).
-2. **Dans la console Spark (Livy/DevX) :** Si tu as accès à l'interface de monitoring de ton cluster Spark, tu devrais voir ton job s'afficher au statut "Running".
-3. **Le test Ultime (Dans Starburst) :** Ouvre l'interface de Starburst et lance la fameuse requête de latence :
-   ```sql
-   SELECT id, dh_poc_spark_read_timestamp, dh_poc_starburst_receive_timestamp 
-   FROM dh_poc_ice.pocspark.cloudevent_direct 
-   ORDER BY dh_poc_starburst_receive_timestamp DESC LIMIT 10;
-   ```
-
-Si des lignes s'affichent et s'actualisent, félicitations, ton architecture CTDF est opérationnelle de bout en bout !
-
-**Une question cruciale pour ton déploiement :** Dans ton entreprise, as-tu le droit de glisser-déposer ton fichier DAG directement dans l'interface Airflow, ou dois-tu obligatoirement le *commiter* sur un dépôt Gitlab/Bitbucket pour qu'un pipeline CI/CD le déploie à ta place ?
-
-
-Merci pour le schéma ! Il est extrêmement clair et nous donne la "Big Picture" de ton projet (l'architecture CTDF). 
-
-Ce schéma valide d'ailleurs à 100 % ce que nous venons de construire ensemble. Regarde bien la flèche en pointillés qui part de la boîte **Sparktacus** vers la boîte **Refined Data storage [Starburst]** : il est explicitement écrit **"SQL insert"**. Ton script hybride Spark/Trino est donc en parfaite adéquation avec la vision des architectes !
-
-Maintenant, décortiquons comment **Apache Airflow** et les **APIs** s'intègrent dans ce schéma précis. Il y a souvent une confusion entre l'API qui reçoit la donnée et l'API qui lance le code.
-
-### 1. Ne pas confondre les deux APIs du schéma
-
-Sur ton schéma, la mention **"Mediation API POST Generic Event"** tout à gauche n'a rien à voir avec Airflow. 
-* C'est la porte d'entrée des données. En production, tu vas supprimer notre petite fonction Python `generate_events()`. À la place, ce sont les applications métier (Source A) qui vont faire des requêtes HTTP POST vers cette API Mediation pour y déposer les JSON.
-* **Le travail d'Airflow ne se situe pas ici.**
-
-### 2. Le vrai rôle d'Airflow (Gérer "Sparktacus")
-
-Ton script (le Stream Spark) s'exécute dans la zone **Sparktacus** (en bas).
-Puisque le schéma indique un **"TARGET : En moins d'une minute"**, ton script est un job de **Streaming continu** (il ne s'arrête jamais). 
-
-Airflow n'est pas fait pour faire tourner du streaming en son sein. Son rôle va être d'agir comme un **Superviseur via l'API du cluster Spark**. Airflow va dire au cluster : *"Voici le script Sparktacus, lance-le. S'il plante, je le relancerai."*
-
-### 3. Le Code Airflow (Le DAG de déploiement)
-
-Pour lancer ton script via Airflow, on utilise l'API de ton cluster (généralement Apache Livy sur les environnements Hadoop/Cloud). Airflow va faire une requête HTTP POST (API) vers le cluster pour soumettre le script Python que tu auras déposé sur le COS.
-
-Voici le DAG Airflow type à implémenter pour orchestrer ton script Sparktacus :
-
-```python
-from airflow import DAG
-from airflow.providers.http.operators.http import SimpleHttpOperator
-from datetime import datetime, timedelta
-import json
-
-# ==========================================
-# 1. CONFIGURATION DU DAG AIRFLOW
-# ==========================================
-default_args = {
-    'owner': 'equipe_data_ctdf',
-    'depends_on_past': False,
-    'email_on_failure': True, # Alerte si le stream plante
-    'retries': 3, # On essaie de relancer 3 fois en cas de crash
-    'retry_delay': timedelta(minutes=2),
-}
-
-# Un DAG de supervision : il vérifie l'état une fois par jour ou se déclenche manuellement
-dag = DAG(
-    'deploy_sparktacus_streaming_api',
-    default_args=default_args,
-    description='Déploie le script Sparktacus (Push vers Starburst) via API',
-    schedule_interval='@daily', 
-    start_date=datetime(2026, 4, 21),
-    catchup=False,
-)
-
-# ==========================================
-# 2. LE PAYLOAD POUR L'API SPARK (Livy)
-# ==========================================
-# C'est ici qu'on indique à l'API quel script exécuter
-spark_livy_payload = {
-    # Le chemin de ton script Python final stocké sur le COS (S3)
-    "file": "s3a://bu002i004226/poc_streaming/scripts/main_cloudevent.py",
-    "name": "Sparktacus-Streaming-To-Starburst",
-    "conf": {
-        "spark.sql.shuffle.partitions": "4",
-        "spark.hadoop.fs.s3a.endpoint": "https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud",
-        "spark.hadoop.fs.s3a.path.style.access": "true"
-    }
-}
-
-# ==========================================
-# 3. L'APPEL API (La tâche Airflow)
-# ==========================================
-# Airflow fait un POST vers l'API de ton cluster pour démarrer le job
-lancer_job_spark = SimpleHttpOperator(
-    task_id='trigger_spark_via_api',
-    http_conn_id='connexion_api_sparktacus', # La connexion définie dans l'interface Airflow (URL + Token)
-    endpoint='/batches', # L'endpoint standard de soumission
-    method='POST',
-    data=json.dumps(spark_livy_payload),
-    headers={"Content-Type": "application/json"},
-    dag=dag,
-)
-
-lancer_job_spark
-```
-
-### Ce qu'il te reste à préparer pour l'industrialisation :
-
-1. **Nettoyer ton code actuel :** Retire toute la partie de génération de données (le `mock_data`). Ton script doit uniquement faire la lecture (`readStream`) et l'écriture (`push_to_starburst_via_python`).
-2. **Uploader le script :** Dépose ce fichier `.py` propre dans un dossier de ton COS (par exemple `s3a://bu002i004226/poc_streaming/scripts/`).
-3. **Créer la connexion dans Airflow :** Dans l'interface web de ton Airflow d'entreprise, ajoute une connexion nommée `connexion_api_sparktacus` avec l'URL de l'API de ton cluster Spark et les identifiants techniques.
-
-
-
-Passer de l'environnement de développement (DevX / Notebook) à **Apache Airflow**, c'est exactement la démarche à suivre pour industrialiser ton PoC et le mettre en production.
-
-Cependant, il y a un point architectural crucial à comprendre avant d'écrire le code : **Airflow est un chef d'orchestre, pas un ouvrier.**
-Airflow ne va pas exécuter ton code Python/Spark sur sa propre machine. Il va envoyer une requête via une **API HTTP (généralement Apache Livy ou une API interne DevX)** pour dire au cluster Spark : *"Tiens, voici le chemin de mon script sur S3, lance-le et préviens-moi quand c'est fini."*
-
-De plus, attention au piège du Streaming : Airflow est fait pour des tâches qui ont un début et une fin (Batch). Si ton script utilise `writeStream.awaitTermination()`, il tournera à l'infini, et la tâche Airflow restera bloquée au statut "Running" pour toujours. 
-
-Voici la méthode standard pour orchestrer ce lancement via API avec Airflow.
-
-### Étape 1 : Déposer le script sur le COS (S3)
-Ton cluster Spark de production ne peut pas lire le fichier `main_cloudevent.py` qui est sur ton espace DevX personnel. Tu dois l'uploader sur ton bucket S3.
-*Exemple : `s3a://bu002i004226/poc_streaming/scripts/main_cloudevent.py`*
-
-### Étape 2 : Le DAG Airflow (Méthode API / Apache Livy)
-
-Dans les environnements Hadoop/Spark d'entreprise (comme IBM Cloud ou les banques), l'API standard pour soumettre des jobs Spark est **Apache Livy**. 
-
-Voici à quoi ressemble le code de ton DAG Airflow (`dag_spark_starburst.py`) qui utilise l'API REST pour lancer ton code.
-
-```python
-from airflow import DAG
-from airflow.providers.http.operators.http import SimpleHttpOperator
-from airflow.providers.http.sensors.http import HttpSensor
-from datetime import datetime, timedelta
-import json
-
-# ==========================================
-# 1. CONFIGURATION DU DAG
-# ==========================================
-default_args = {
-    'owner': 'data_engineering_team',
-    'depends_on_past': False,
-    'email_on_failure': False,
-    'email_on_retry': False,
-    'retries': 1,
-    'retry_delay': timedelta(minutes=5),
-}
-
-dag = DAG(
-    'poc_spark_starburst_api',
-    default_args=default_args,
-    description='Lance le job Spark vers Starburst via API REST',
-    schedule_interval=timedelta(hours=1), # Lancement toutes les heures (Mode Batch)
-    start_date=datetime(2026, 4, 21),
-    catchup=False,
-)
-
-# ==========================================
-# 2. LE PAYLOAD (La requête API)
-# ==========================================
-# C'est ici qu'on dit à l'API quel fichier lancer et avec quelle puissance
-livy_payload = {
-    "file": "s3a://bu002i004226/poc_streaming/scripts/main_cloudevent.py",
-    "name": "PoC-Airflow-Starburst",
-    "conf": {
-        "spark.sql.shuffle.partitions": "4",
-        "spark.hadoop.fs.s3a.endpoint": "https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud"
-    }
-}
-
-# ==========================================
-# 3. LES TÂCHES AIRFLOW
-# ==========================================
-
-# Tâche 1 : Soumettre le job Spark via l'API (POST)
-submit_spark_job = SimpleHttpOperator(
-    task_id='submit_spark_job_via_api',
-    http_conn_id='spark_livy_api_conn', # Connexion configurée dans l'interface Airflow
-    endpoint='/batches', # Endpoint standard de l'API Livy
-    method='POST',
-    data=json.dumps(livy_payload),
-    headers={"Content-Type": "application/json"},
-    response_filter=lambda response: response.json()['id'], # Récupère l'ID du job
-    dag=dag,
-)
-
-# Tâche 2 : Vérifier si le job est terminé (Polling API)
-# Airflow va interroger l'API toutes les 60 secondes pour voir si le job est "success"
-monitor_spark_job = HttpSensor(
-    task_id='monitor_spark_job',
-    http_conn_id='spark_livy_api_conn',
-    endpoint='/batches/{{ task_instance.xcom_pull(task_ids="submit_spark_job_via_api") }}',
-    method='GET',
-    response_check=lambda response: response.json()['state'] == 'success',
-    poke_interval=60,
-    timeout=3600, # Tombe en erreur si le job dure plus d'une heure
-    dag=dag,
-)
-
-# ==========================================
-# 4. L'ORDRE D'EXÉCUTION
-# ==========================================
-submit_spark_job >> monitor_spark_job
-```
-
-### Comment l'intégrer dans ton entreprise ?
-
-Pour que ce DAG fonctionne, il te manque une information clé : l'adresse de l'API de ton cluster de production.
-
-Dans l'interface web de ton Airflow (menu *Admin* > *Connections*), tu devras créer une connexion nommée `spark_livy_api_conn`. C'est là que tu mettras l'URL fournie par ton équipe d'infrastructure (par exemple : `https://spark-cluster.banque.intra:8998`) et les identifiants techniques associés.
-
-**Sais-tu si ton entreprise utilise un orchestrateur Airflow standard avec l'API Apache Livy, ou s'ils ont développé leurs propres "Custom Operators" (des opérateurs Airflow spécifiques à la BNP) pour lancer les jobs DevX ?**
-
-
-
-C'est noté, je l'élimine définitivement. Désolé d'avoir insisté avec ça !
-
-Voici le code hybride (Spark + API REST Python) **totalement expurgé de `dotenv`**. Tu as juste à mettre ton identifiant à la ligne 12 et c'est parti.
+### Le Code Spark "Python Push REST" (La version blindée)
 
 ```python
 import time
@@ -249,26 +13,31 @@ from datetime import datetime
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import current_timestamp, col
 from pyspark.sql.types import StructType, StructField, StringType
+# Le module magique qui passe le pare-feu
 import trino
 
 # ==========================================
-# 1. CONFIGURATIONS (Sans dotenv)
+# 1. CONFIGURATIONS
 # ==========================================
-# Mets ton identifiant ici en dur
-STARBURST_USER = "ton_identifiant" 
+# Mets ton identifiant interne ici (en dur)
+STARBURST_USER = "ton_identifiant_bnp" 
 
+# Configurations Cloud / S3
 S3_ENDPOINT = "https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud"
 S3_RAW_PATH = "s3a://bu002i004226/poc_streaming/input_cloudevent_raw/"
 
+# Checkpoint dynamique pour éviter les crashs de relance
 run_id = int(time.time())
 CHECKPOINT_PATH = f"s3a://bu002i004226/poc_streaming/checkpoint_direct_{run_id}/"
 
+# Informations du cluster Starburst
 TRINO_HOST = "starburst-ap26761-dev-05b792a6.data.cloud.net.intra"
 TRINO_PORT = 443
 
 # ==========================================
-# 2. INITIALISATION SPARK
+# 2. INITIALISATION SPARK (Ultra légère)
 # ==========================================
+# Plus aucun paramètre JDBC ou JAR ici, on laisse Java tranquille.
 spark = SparkSession.builder \
     .appName("PoC-Push-To-Starburst-PythonREST") \
     .config("spark.hadoop.fs.s3a.endpoint", S3_ENDPOINT) \
@@ -284,11 +53,11 @@ schema_events = StructType([
 ])
 
 # ==========================================
-# 3. GÉNÉRATION DES DONNÉES
+# 3. GÉNÉRATION DES DONNÉES (Lot de test)
 # ==========================================
-print("### [ÉTAPE 1] Génération d'un lot de données... ###")
+print("### [ÉTAPE 1] Génération d'un lot de données de test... ###")
 mock_data = []
-for i in range(20):
+for i in range(20): # Un petit batch de 20 lignes pour tester l'API
     now = datetime.utcnow().isoformat()[:-3] + "Z"
     mock_data.append((str(uuid.uuid4()), now, now))
 
@@ -297,12 +66,13 @@ df_gen.write.mode("overwrite").json(S3_RAW_PATH)
 print("### [ÉTAPE 1] 20 événements générés avec succès. ###\n")
 
 # ==========================================
-# 4. STREAMING : SPARK -> PYTHON TRINO -> STARBURST
+# 4. STREAMING : SPARK -> TRINO PYTHON -> STARBURST
 # ==========================================
 print("### [ÉTAPE 2] DÉMARRAGE DU STREAMING HYBRIDE ###")
 
 df_stream = spark.readStream.format("json").schema(schema_events).load(S3_RAW_PATH)
 
+# Spark calcule le T3 très rapidement en mémoire
 df_processed = df_stream.select(
     col("id"),
     col("time"), # T1
@@ -310,36 +80,42 @@ df_processed = df_stream.select(
     current_timestamp().cast("timestamp").alias("dh_poc_spark_read_timestamp") # T3
 )
 
+# La fonction de secours : Python prend le relais pour envoyer le SQL
 def push_to_starburst_via_python(df, batch_id):
+    # On ramène les données de ce micro-batch dans la mémoire Python
     rows = df.collect() 
     
     if len(rows) > 0:
         print(f"### Préparation de l'envoi du batch {batch_id} ({len(rows)} lignes)... ###")
         
+        # On construit la grosse requête SQL (INSERT INTO ... VALUES ...)
         values_list = []
         for row in rows:
+            # Formatage propre du timestamp pour Trino/Starburst
             t3_str = row.dh_poc_spark_read_timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
             values_list.append(f"('{row.id}', '{row.time}', '{row.dh_poc_gen_timestamp}', TIMESTAMP '{t3_str}')")
             
         values_string = ",\n".join(values_list)
         sql_query = f"INSERT INTO dh_poc_ice.pocspark.cloudevent_direct (id, time, dh_poc_gen_timestamp, dh_poc_spark_read_timestamp) VALUES {values_string}"
         
+        # Envoi de la requête via l'API HTTP Trino
         try:
             conn = trino.dbapi.connect(
                 host=TRINO_HOST,
                 port=TRINO_PORT,
                 user=STARBURST_USER,
                 http_scheme='https',
-                verify=False
+                verify=False # On désactive la vérification stricte du certificat SSL interne
             )
             cur = conn.cursor()
             cur.execute(sql_query)
-            print(f"### -> Batch {batch_id} inséré avec succès dans Starburst via REST ! ###")
+            print(f"### -> Batch {batch_id} inséré avec succès dans Starburst via l'API REST ! ###")
         except Exception as e:
             print(f"\n[!!!] ERREUR TRINO SUR LE BATCH {batch_id} [!!!]")
             print(str(e))
             print("--------------------------------------------------\n")
 
+# Lancement de l'orchestration du flux
 query = df_processed.writeStream \
     .foreachBatch(push_to_starburst_via_python) \
     .option("checkpointLocation", CHECKPOINT_PATH) \
@@ -349,4 +125,161 @@ query = df_processed.writeStream \
 query.awaitTermination()
 ```
 
-Plus de fichier caché, plus d'import `os`, juste du Python pur ! Dis-moi si ce module passe enfin le pare-feu.
+### Le conseil pour ta démo :
+Puisque tu vas utiliser `verify=False` (la ligne qui dit à Python d'ignorer les alertes de certificat de la banque), tu vas peut-être voir des petits messages d'avertissement jaunes (`InsecureRequestWarning`) 
+
+
+
+Voici le code complet, définitif et consolidé de l'architecture "Hybride REST" (PySpark + Python Trino). 
+
+Il intègre toutes les solutions que nous avons validées ensemble :
+* **Zéro JDBC / Zéro fichier JAR :** Contournement total du pare-feu bancaire en utilisant l'API REST via le module Python `trino`.
+* **Zéro `dotenv` :** Ton identifiant est à renseigner directement dans les variables.
+* **Intégration Spark UI :** Remontée des statuts de tes micro-batchs en direct dans l'interface visuelle de Spark (onglet Jobs) et journalisation propre des erreurs (stderr).
+
+### Le Code Final (`main_cloudevent.py`)
+
+```python
+import sys
+import time
+import uuid
+from datetime import datetime
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import current_timestamp, col
+from pyspark.sql.types import StructType, StructField, StringType
+
+# Le module autorisé par la sécurité pour l'API REST
+import trino
+
+# ==========================================
+# 1. CONFIGURATIONS
+# ==========================================
+# Remplace par ton identifiant interne BNP Paribas
+STARBURST_USER = "ton_identifiant_bnp" 
+
+# Configurations S3 (Cloud Object Storage)
+S3_ENDPOINT = "https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud"
+S3_RAW_PATH = "s3a://bu002i004226/poc_streaming/input_cloudevent_raw/"
+
+# Génération d'un dossier de checkpoint unique par exécution pour éviter les conflits
+run_id = int(time.time())
+CHECKPOINT_PATH = f"s3a://bu002i004226/poc_streaming/checkpoint_direct_{run_id}/"
+
+# Informations d'accès à l'API du cluster Starburst
+TRINO_HOST = "starburst-ap26761-dev-05b792a6.data.cloud.net.intra"
+TRINO_PORT = 443
+
+# ==========================================
+# 2. INITIALISATION SPARK (Allégée)
+# ==========================================
+# Plus aucun paramètre JDBC ou JAR. Java s'occupe uniquement du calcul interne.
+spark = SparkSession.builder \
+    .appName("PoC-Push-To-Starburst-PythonREST") \
+    .config("spark.hadoop.fs.s3a.endpoint", S3_ENDPOINT) \
+    .config("spark.hadoop.fs.s3a.path.style.access", "true") \
+    .getOrCreate()
+    
+spark.sparkContext.setLogLevel("WARN")
+
+schema_events = StructType([
+    StructField("id", StringType(), True),
+    StructField("time", StringType(), True),
+    StructField("dh_poc_gen_timestamp", StringType(), True)
+])
+
+# ==========================================
+# 3. GÉNÉRATION DES DONNÉES (Pour le PoC)
+# ==========================================
+print("### [ÉTAPE 1] Génération d'un lot de données de test... ###")
+mock_data = []
+for i in range(20): # Un petit batch de 20 lignes pour tester le flux
+    now = datetime.utcnow().isoformat()[:-3] + "Z"
+    mock_data.append((str(uuid.uuid4()), now, now))
+
+df_gen = spark.createDataFrame(mock_data, schema=schema_events)
+df_gen.write.mode("overwrite").json(S3_RAW_PATH)
+print("### [ÉTAPE 1] 20 événements générés avec succès sur S3. ###\n")
+
+# ==========================================
+# 4. STREAMING : SPARK -> TRINO PYTHON -> STARBURST
+# ==========================================
+print("### [ÉTAPE 2] DÉMARRAGE DU STREAMING HYBRIDE ###")
+
+df_stream = spark.readStream.format("json").schema(schema_events).load(S3_RAW_PATH)
+
+# Ajout du T3 (Moment de la prise en charge par Spark)
+df_processed = df_stream.select(
+    col("id"),
+    col("time"), # T1
+    col("dh_poc_gen_timestamp"), # T2
+    current_timestamp().cast("timestamp").alias("dh_poc_spark_read_timestamp") # T3
+)
+
+# Fonction de traitement du micro-batch : Conversion en SQL et envoi API
+def push_to_starburst_via_python(df, batch_id):
+    
+    # Récupération des données du batch en mémoire Python
+    rows = df.collect() 
+    nb_lignes = len(rows)
+    
+    if nb_lignes > 0:
+        # Mise à jour du Spark UI : Phase de préparation
+        spark.sparkContext.setJobDescription(f"Batch N°{batch_id} - Préparation API ({nb_lignes} lignes)")
+        print(f"### [BATCH {batch_id}] Préparation de la requête SQL... ###")
+        
+        # Construction de la requête INSERT SQL géante
+        values_list = []
+        for row in rows:
+            # Formatage propre du timestamp pour Trino
+            t3_str = row.dh_poc_spark_read_timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            values_list.append(f"('{row.id}', '{row.time}', '{row.dh_poc_gen_timestamp}', TIMESTAMP '{t3_str}')")
+            
+        values_string = ",\n".join(values_list)
+        sql_query = f"INSERT INTO dh_poc_ice.pocspark.cloudevent_direct (id, time, dh_poc_gen_timestamp, dh_poc_spark_read_timestamp) VALUES {values_string}"
+        
+        try:
+            # Mise à jour du Spark UI : Phase d'envoi réseau
+            spark.sparkContext.setJobDescription(f"Batch N°{batch_id} - Envoi réseau (API Trino)...")
+            
+            # Connexion REST vers Starburst
+            conn = trino.dbapi.connect(
+                host=TRINO_HOST,
+                port=TRINO_PORT,
+                user=STARBURST_USER,
+                http_scheme='https',
+                verify=False # Contournement des alertes de certificat local
+            )
+            cur = conn.cursor()
+            cur.execute(sql_query)
+            
+            # Mise à jour du Spark UI : Succès
+            spark.sparkContext.setJobDescription(f"Batch N°{batch_id} - SUCCÈS")
+            print(f"### -> Batch {batch_id} ({nb_lignes} lignes) inséré avec succès dans Starburst ! ###")
+            
+        except Exception as e:
+            # Mise à jour du Spark UI : Échec + Écriture dans le flux d'erreur (stderr)
+            spark.sparkContext.setJobDescription(f"Batch N°{batch_id} - ÉCHEC FATAL API")
+            print(f"\n[!!!] ERREUR TRINO SUR LE BATCH {batch_id} [!!!]", file=sys.stderr)
+            print(str(e), file=sys.stderr)
+            print("--------------------------------------------------\n", file=sys.stderr)
+            
+    else:
+        # Batch sans nouvelle donnée
+        spark.sparkContext.setJobDescription(f"Batch N°{batch_id} - Ignoré (Aucune nouvelle ligne)")
+
+
+# Lancement continu de l'orchestration
+query = df_processed.writeStream \
+    .foreachBatch(push_to_starburst_via_python) \
+    .option("checkpointLocation", CHECKPOINT_PATH) \
+    .trigger(processingTime="5 seconds") \
+    .start()
+
+query.awaitTermination()
+```
+
+
+
+dans la console de DevX. Ne t'inquiète pas, c'est normal et ça ne bloque pas l'exécution du code ni l'insertion de tes données. 
+
+Lance ça, et ton tableau Starburst devrait enfin se remplir avec un vrai **T4** !
