@@ -1,3 +1,89 @@
+C'est une excellente nouvelle déguisée en erreur ! 
+
+Regarde bien la ligne : **`HTTP Error 401: Unauthorized`**.
+
+### Ce que ça signifie :
+1. **La connexion réseau fonctionne !** Ton script a réussi à traverser le cluster Kubernetes, a esquivé le proxy, et a tapé à la porte du serveur Starburst. C'est une immense victoire.
+2. **Le module natif fonctionne !** Plus aucune erreur de module introuvable.
+3. **Le problème actuel (401) :** Le serveur Starburst a ouvert la porte, mais il t'a dit : *"Je vois bien ton nom d'utilisateur, mais il me manque ton mot de passe"*. 
+
+L'API de ton Starburst exige une **Authentification Basic** (nom d'utilisateur + mot de passe), alors que dans notre fonction native, nous n'avions mis que le nom d'utilisateur.
+
+### La Solution : Ajouter le mot de passe (Basic Auth)
+
+Il faut simplement encoder ton mot de passe et l'ajouter dans les "headers" (l'en-tête) de la requête HTTP.
+
+Voici les **3 modifications** à faire dans ton code `main_cloudevent.py` :
+
+**1. Ajoute l'importation de `base64` tout en haut :**
+```python
+import sys
+import time
+import uuid
+import json
+import ssl
+import urllib.request
+import base64 # <-- NOUVEAU
+from datetime import datetime
+```
+
+**2. Ajoute ton mot de passe dans les configurations :**
+```python
+# ==========================================
+# 1. CONFIGURATIONS
+# ==========================================
+STARBURST_USER = "ton_identifiant_bnp" 
+STARBURST_PASS = "ton_mot_de_passe" # <-- NOUVEAU
+```
+
+**3. Remplace intégralement la fonction native par celle-ci (qui gère le mot de passe) :**
+```python
+# ==========================================
+# 4. FONCTION API TRINO NATIVE (Avec Authentification)
+# ==========================================
+def execute_trino_query_natively(query, host, port, user, password):
+    url = f"https://{host}:{port}/v1/statement"
+    
+    # Création du jeton d'authentification Basic (Base64)
+    auth_string = f"{user}:{password}"
+    auth_base64 = base64.b64encode(auth_string.encode('utf-8')).decode('utf-8')
+    
+    headers = {
+        'X-Trino-User': user,
+        'X-Trino-Source': 'PySpark-Streaming-Native',
+        'Authorization': f'Basic {auth_base64}' # <-- NOUVEAU : Envoi du mot de passe
+    }
+    
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    req = urllib.request.Request(url, data=query.encode('utf-8'), headers=headers, method='POST')
+    with urllib.request.urlopen(req, context=ctx) as response:
+        res_data = json.loads(response.read().decode('utf-8'))
+        
+    while 'nextUri' in res_data:
+        next_uri = res_data['nextUri']
+        req_next = urllib.request.Request(next_uri, headers=headers, method='GET')
+        with urllib.request.urlopen(req_next, context=ctx) as response_next:
+            res_data = json.loads(response_next.read().decode('utf-8'))
+            
+        if 'error' in res_data:
+            raise Exception(f"Erreur SQL Trino : {res_data['error']['message']}")
+            
+    return True
+```
+
+**4. N'oublie pas de mettre à jour l'appel de la fonction dans ta boucle (pour lui passer le mot de passe) :**
+Vers la fin du script, dans le bloc `try:`, remplace l'ancienne ligne par celle-ci :
+```python
+            # Appel de notre fonction avec le mot de passe
+            execute_trino_query_natively(sql_query, TRINO_HOST, TRINO_PORT, STARBURST_USER, STARBURST_PASS)
+```
+
+Relance ton script `submit_sparktacus.sh` avec ça. Le 401 devrait disparaître et les données devraient atterrir dans ta table !
+
+
 C'est **exactement** le "Problème 1" dont je t'ai parlé dans mon message précédent ! C'est le piège classique des environnements conteneurisés.
 
 Voici ce qui se passe pour bien comprendre :
