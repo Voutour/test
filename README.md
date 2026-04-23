@@ -1,3 +1,225 @@
+Tu as **parfaitement raison**, et ton analyse est digne d'un vrai Data Engineer ! 
+
+L'image que tu as envoyée montre une belle réussite technique (la donnée arrive bien de bout en bout), mais elle met aussi en lumière le biais de notre test : puisque tout a été généré et envoyé dans la même fraction de seconde par le même script, la latence est virtuellement nulle. Les T1, T2, T3 et T4 sont agglutinés.
+
+Pour simuler la **vraie vie** (et la vraie architecture CTDF de ton schéma), il faut absolument **découpler** la génération de l'ingestion. 
+
+Voici la stratégie idéale pour ton PoC :
+1. **Script A (Le vrai Sparktacus) :** Il tourne sur Kubernetes (via ton `submit_sparktacus.sh`), il ne fait *que* lire en continu et envoyer à Starburst.
+2. **Script B (Le simulateur de l'API Mediation) :** Il tourne en direct dans ton interface DevX. C'est une boucle infinie qui dépose des petits fichiers JSON sur le COS toutes les X secondes.
+
+De cette façon, tu auras un vrai flux asynchrone, et tu verras enfin un vrai décalage entre le T1 (Génération) et le T4 (Arrivée Starburst) !
+
+---
+
+### Script 1 : Le Générateur Continu (À lancer dans ton IDE DevX)
+
+Crée un nouveau fichier appelé `generate_events.py` dans ton espace de travail DevX et lance-le directement dans ton terminal local (avec `python generate_events.py`). Il va tourner en boucle et "nourrir" ton bucket S3.
+
+```python
+import time
+import uuid
+from datetime import datetime
+from pyspark.sql import SparkSession
+from pyspark.sql.types import StructType, StructField, StringType
+
+# ==========================================
+# CONFIGURATIONS
+# ==========================================
+S3_ENDPOINT = "https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud"
+S3_RAW_PATH = "s3a://bu002i004226/poc_streaming/input_cloudevent_raw/"
+
+# Initialisation d'un Spark local juste pour écrire sur le COS
+spark = SparkSession.builder \
+    .appName("PoC-Simulateur-API-Mediation") \
+    .config("spark.hadoop.fs.s3a.endpoint", S3_ENDPOINT) \
+    .config("spark.hadoop.fs.s3a.path.style.access", "true") \
+    .getOrCreate()
+spark.sparkContext.setLogLevel("ERROR")
+
+schema_events = StructType([
+    StructField("id", StringType(), True),
+    StructField("time", StringType(), True),
+    StructField("dh_poc_gen_timestamp", StringType(), True)
+])
+
+print("### DÉMARRAGE DU SIMULATEUR DE FLUX CONTINU ###")
+print("Appuyez sur Ctrl+C pour arrêter la génération.\n")
+
+batch_num = 1
+try:
+    while True:
+        mock_data = []
+        # On simule l'arrivée de 5 événements en même temps
+        for i in range(5):
+            now = datetime.utcnow().isoformat()[:-3] + "Z"
+            mock_data.append((str(uuid.uuid4()), now, now))
+
+        df_gen = spark.createDataFrame(mock_data, schema=schema_events)
+        
+        # TRÈS IMPORTANT : Mode "append" pour ajouter des fichiers sans écraser les anciens
+        df_gen.write.mode("append").json(S3_RAW_PATH)
+        
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] -> Vague {batch_num} déposée sur le COS (5 events).")
+        batch_num += 1
+        
+        # On attend 4 secondes avant d'envoyer la vague suivante
+        time.sleep(4) 
+        
+except KeyboardInterrupt:
+    print("\n### ARRÊT DU SIMULATEUR ###")
+```
+
+---
+
+### Script 2 : Le Job Sparktacus "Propre" (À soumettre via Kubernetes)
+
+Voici ton `main_cloudevent.py` expurgé de toute la partie génération. C'est ce script que tu dois uploader sur ton S3 et lancer via ton `submit_sparktacus.sh`. Il est maintenant concentré à 100% sur le Streaming et l'envoi API.
+
+```python
+import sys
+import time
+import json
+import ssl
+import urllib.request
+import base64 
+from datetime import datetime
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import current_timestamp, col
+from pyspark.sql.types import StructType, StructField, StringType
+
+# ==========================================
+# 1. CONFIGURATIONS
+# ==========================================
+STARBURST_USER = "ton_identifiant_bnp" 
+STARBURST_PASS = "ton_mot_de_passe" 
+
+S3_ENDPOINT = "https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud"
+S3_RAW_PATH = "s3a://bu002i004226/poc_streaming/input_cloudevent_raw/"
+
+run_id = int(time.time())
+CHECKPOINT_PATH = f"s3a://bu002i004226/poc_streaming/checkpoint_direct_{run_id}/"
+
+TRINO_HOST = "starburst-ap26761-dev-05b792a6.data.cloud.net.intra"
+TRINO_PORT = 443
+
+# ==========================================
+# 2. INITIALISATION SPARK
+# ==========================================
+spark = SparkSession.builder \
+    .appName("PoC-Push-To-Starburst-NativeREST") \
+    .config("spark.hadoop.fs.s3a.endpoint", S3_ENDPOINT) \
+    .config("spark.hadoop.fs.s3a.path.style.access", "true") \
+    .getOrCreate()
+    
+spark.sparkContext.setLogLevel("WARN")
+
+schema_events = StructType([
+    StructField("id", StringType(), True),
+    StructField("time", StringType(), True),
+    StructField("dh_poc_gen_timestamp", StringType(), True)
+])
+
+# ==========================================
+# 3. FONCTION API TRINO NATIVE
+# ==========================================
+def execute_trino_query_natively(query, host, port, user, password):
+    url = f"https://{host}:{port}/v1/statement"
+    
+    auth_string = f"{user}:{password}"
+    auth_base64 = base64.b64encode(auth_string.encode('utf-8')).decode('utf-8')
+    headers = {
+        'X-Trino-User': user,
+        'X-Trino-Source': 'PySpark-Streaming-Native',
+        'Authorization': f'Basic {auth_base64}'
+    }
+    
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    req = urllib.request.Request(url, data=query.encode('utf-8'), headers=headers, method='POST')
+    with urllib.request.urlopen(req, context=ctx) as response:
+        res_data = json.loads(response.read().decode('utf-8'))
+        
+    while 'nextUri' in res_data:
+        next_uri = res_data['nextUri']
+        req_next = urllib.request.Request(next_uri, headers=headers, method='GET')
+        with urllib.request.urlopen(req_next, context=ctx) as response_next:
+            res_data = json.loads(response_next.read().decode('utf-8'))
+            
+        if 'error' in res_data:
+            raise Exception(f"Erreur SQL Trino : {res_data['error']['message']}")
+            
+    return True
+
+# ==========================================
+# 4. STREAMING
+# ==========================================
+print("### DÉMARRAGE DU STREAMING : EN ATTENTE DE DONNÉES... ###")
+
+df_stream = spark.readStream.format("json").schema(schema_events).load(S3_RAW_PATH)
+
+df_processed = df_stream.select(
+    col("id"),
+    col("time"),
+    col("dh_poc_gen_timestamp"),
+    current_timestamp().cast("timestamp").alias("dh_poc_spark_read_timestamp")
+)
+
+def push_to_starburst_via_python(df, batch_id):
+    rows = df.collect() 
+    nb_lignes = len(rows)
+    
+    if nb_lignes > 0:
+        spark.sparkContext.setJobDescription(f"Batch N°{batch_id} - Préparation API ({nb_lignes} lignes)")
+        
+        values_list = []
+        for row in rows:
+            t3_str = row.dh_poc_spark_read_timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            # Utilisation du CAST(CURRENT_TIMESTAMP...) pour le T4 !
+            values_list.append(f"('{row.id}', '{row.time}', '{row.dh_poc_gen_timestamp}', TIMESTAMP '{t3_str}', CAST(CURRENT_TIMESTAMP AS TIMESTAMP(3)))")
+            
+        values_string = ",\n".join(values_list)
+        sql_query = f"INSERT INTO dh_poc_ice.pocspark.cloudevent_direct (id, time, dh_poc_gen_timestamp, dh_poc_spark_read_timestamp, dh_poc_starburst_receive_timestamp) VALUES {values_string}"
+        
+        try:
+            spark.sparkContext.setJobDescription(f"Batch N°{batch_id} - Envoi réseau...")
+            execute_trino_query_natively(sql_query, TRINO_HOST, TRINO_PORT, STARBURST_USER, STARBURST_PASS)
+            
+            spark.sparkContext.setJobDescription(f"Batch N°{batch_id} - SUCCÈS")
+            print(f"### -> Batch {batch_id} ({nb_lignes} lignes) inséré avec succès ! ###")
+            
+        except Exception as e:
+            spark.sparkContext.setJobDescription(f"Batch N°{batch_id} - ÉCHEC FATAL API")
+            print(f"\n[!!!] ERREUR SUR LE BATCH {batch_id} [!!!]", file=sys.stderr)
+            print(str(e), file=sys.stderr)
+            print("--------------------------------------------------\n", file=sys.stderr)
+            
+    else:
+        spark.sparkContext.setJobDescription(f"Batch N°{batch_id} - Ignoré (Aucune ligne)")
+
+query = df_processed.writeStream \
+    .foreachBatch(push_to_starburst_via_python) \
+    .option("checkpointLocation", CHECKPOINT_PATH) \
+    .trigger(processingTime="2 seconds") \
+    .start()
+
+query.awaitTermination()
+```
+
+### Le protocole de test pour mesurer la latence
+
+Pour que ce test soit parfait :
+1. **Vide ton dossier d'input sur le S3** (supprime les vieux JSON des tests précédents pour repartir à zéro).
+2. Lance ton job Sparktacus via `./submit_sparktacus.sh`. Regarde les logs, il devrait dire "En attente de données" et ne rien faire.
+3. Dans ton IDE DevX, lance le script Python `generate_events.py`.
+4. Regarde les logs de Kubernetes : tu vas voir Spark se réveiller et insérer les Batchs 1, 2, 3 au rythme des vagues générées !
+5. Ouvre Starburst, relance ta requête `SELECT`, et admire enfin tes millisecondes d'écart entre T1, T2, T3 et T4.
+
+Dis-moi si tu arrives à lancer les deux en parallèle !
+
+
 C'est une étape classique et très importante en ingénierie de la donnée : **documenter et justifier ses choix d'architecture**, surtout quand on dévie du standard "attendu" (le JDBC) pour s'adapter à la réalité de l'infrastructure de la banque.
 
 Voici comment tu peux justifier ce choix de manière très professionnelle (pour un ticket JIRA, un dossier d'architecture ou un point avec ton Lead), suivi du décryptage du code.
