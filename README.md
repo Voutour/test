@@ -1,3 +1,75 @@
+C'est un grand classique des Data Lakes ! Tu viens de te heurter à l'une des différences majeures entre une base de données relationnelle classique (comme PostgreSQL ou Oracle) et un moteur de Data Lake distribué (comme Starburst/Trino sur Iceberg).
+
+### Pourquoi ça ne marche pas ?
+Dans les bases de données classiques, `DEFAULT CURRENT_TIMESTAMP` est évalué dynamiquement à chaque insertion. 
+Mais dans le monde du Big Data (Iceberg via Trino), les valeurs par défaut au moment de la création de la table doivent généralement être des **constantes** (du texte fixe ou des chiffres). Le moteur refuse d'y attacher une fonction dynamique comme `CURRENT_TIMESTAMP` car il a du mal à garantir sa cohérence sur un cluster de centaines de serveurs.
+
+### La Solution : Gérer le T4 directement dans la requête
+
+Puisque Starburst refuse de le faire automatiquement dans la définition de la table, **nous allons l'obliger à le faire au moment de l'insertion**. L'effet sera exactement le même : c'est bien le serveur Starburst qui calculera l'heure exacte à la milliseconde (T4) au moment où il recevra la requête !
+
+Voici les deux étapes rapides pour corriger ça :
+
+### Étape 1 : Recréer la table sans le `DEFAULT`
+
+Supprime l'ancienne table (si elle a été partiellement créée) et relance cette commande épurée :
+
+```sql
+DROP TABLE IF EXISTS dh_poc_ice.pocspark.cloudevent_direct;
+
+CREATE TABLE dh_poc_ice.pocspark.cloudevent_direct (
+    id VARCHAR,
+    time VARCHAR, 
+    dh_poc_gen_timestamp VARCHAR, 
+    dh_poc_spark_read_timestamp TIMESTAMP(3), 
+    dh_poc_starburst_receive_timestamp TIMESTAMP(3) -- On a retiré le DEFAULT
+)
+WITH (
+    type = 'ICEBERG',
+    format = 'PARQUET',
+    location = 's3a://bu002i004226/poc_streaming/table_cloudevent_direct/'
+);
+```
+
+### Étape 2 : Modifier 2 lignes dans ton code PySpark
+
+Dans ton script `main_cloudevent.py`, cherche la fonction `push_to_starburst_via_python`. Nous allons modifier la construction de la requête SQL pour injecter `CAST(CURRENT_TIMESTAMP AS TIMESTAMP(3))` directement dans les valeurs.
+
+Remplace ce bloc :
+```python
+        # Ancienne version
+        values_list = []
+        for row in rows:
+            t3_str = row.dh_poc_spark_read_timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            values_list.append(f"('{row.id}', '{row.time}', '{row.dh_poc_gen_timestamp}', TIMESTAMP '{t3_str}')")
+            
+        values_string = ",\n".join(values_list)
+        sql_query = f"INSERT INTO dh_poc_ice.pocspark.cloudevent_direct (id, time, dh_poc_gen_timestamp, dh_poc_spark_read_timestamp) VALUES {values_string}"
+```
+
+Par ce bloc :
+```python
+        # Nouvelle version (avec le T4 géré par Starburst)
+        values_list = []
+        for row in rows:
+            t3_str = row.dh_poc_spark_read_timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            # On ajoute CAST(CURRENT_TIMESTAMP AS TIMESTAMP(3)) comme 5ème valeur
+            values_list.append(f"('{row.id}', '{row.time}', '{row.dh_poc_gen_timestamp}', TIMESTAMP '{t3_str}', CAST(CURRENT_TIMESTAMP AS TIMESTAMP(3)))")
+            
+        values_string = ",\n".join(values_list)
+        # On ajoute la colonne dh_poc_starburst_receive_timestamp dans l'INSERT
+        sql_query = f"INSERT INTO dh_poc_ice.pocspark.cloudevent_direct (id, time, dh_poc_gen_timestamp, dh_poc_spark_read_timestamp, dh_poc_starburst_receive_timestamp) VALUES {values_string}"
+```
+
+De cette façon, quand ton script Spark enverra la requête à Starburst, elle ressemblera à ça :
+`INSERT INTO ... VALUES ('uuid', 't1', 't2', 't3', CAST(CURRENT_TIMESTAMP AS TIMESTAMP(3)))`
+
+C'est **Starburst** qui exécutera la fonction `CURRENT_TIMESTAMP` au moment de la réception, te donnant ainsi ton véritable T4 !
+
+***
+
+As-tu pu exécuter cette nouvelle création de table et relancer ton script pour vérifier que ton T4 se remplit correctement dans l'interface ?
+
 C'est une excellente nouvelle déguisée en erreur ! 
 
 Regarde bien la ligne : **`HTTP Error 401: Unauthorized`**.
