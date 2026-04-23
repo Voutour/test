@@ -1,3 +1,95 @@
+C'est une étape classique et très importante en ingénierie de la donnée : **documenter et justifier ses choix d'architecture**, surtout quand on dévie du standard "attendu" (le JDBC) pour s'adapter à la réalité de l'infrastructure de la banque.
+
+Voici comment tu peux justifier ce choix de manière très professionnelle (pour un ticket JIRA, un dossier d'architecture ou un point avec ton Lead), suivi du décryptage du code.
+
+---
+
+### 1. Comment justifier ce choix d'architecture (L'argumentaire)
+
+Tu n'as pas fait du "bricolage", tu as implémenté une **Architecture Hybride (Spark-to-REST)** pour répondre à des contraintes strictes d'infrastructure. Voici tes 3 arguments clés :
+
+* **Argument 1 : Immutabilité des conteneurs Kubernetes (Le problème du `pip install`)**
+    * *Explication :* Le script de déploiement `submit_sparktacus.sh` lance des Pods Kubernetes basés sur l'image officielle et stérile `spark-bnpp:3.4-3.0`. Cette image ne contient pas la librairie Python `trino`. Impossible d'y faire un `pip install` dynamique en production sans casser les normes de sécurité. La solution native (`urllib`) est la seule qui tourne sur 100% des conteneurs sans dépendance externe.
+* **Argument 2 : Blocage réseau et Firewall (Le problème du `.jar`)**
+    * *Explication :* La méthode classique JDBC demande à Java de télécharger dynamiquement le connecteur (`trino-jdbc.jar`) via `spark.jars.packages`. Ce téléchargement est bloqué par le proxy/firewall de la banque vers Maven Central (Exit Code 2).
+* **Argument 3 : L'image de base incomplète (La cause racine)**
+    * *Explication :* L'image Docker fournie par l'équipe Data Platform n'embarque pas nativement le fichier JAR de Trino dans le dossier `/opt/spark/jars/`. 
+    * **Conclusion :** *"Plutôt que de bloquer le projet en attendant une refonte de l'image Docker par l'équipe infrastructure, j'ai opté pour une approche par API REST (HTTP) native. C'est robuste, ça passe le proxy, ça gère l'authentification et ça permet de prouver la valeur du PoC immédiatement."*
+
+---
+
+### 2. Les parties du code qui font le contournement
+
+Il y a **deux blocs de code** qui opèrent cette magie. Voici comment ils fonctionnent.
+
+#### Bloc N°1 : La fonction de communication (Le faux driver)
+Puisque Spark (Java) ne peut pas parler à Starburst via JDBC, on a créé une fonction en pur Python qui parle à Starburst via son API web (HTTP).
+
+```python
+# ==========================================
+# LE CONTOURNEMENT N°1 : LA FONCTION API NATIVE
+# ==========================================
+def execute_trino_query_natively(query, host, port, user, password):
+    url = f"https://{host}:{port}/v1/statement" # <--- L'API de Starburst
+    
+    # 1. On gère la sécurité (Basic Auth) que JDBC faisait automatiquement
+    auth_string = f"{user}:{password}"
+    auth_base64 = base64.b64encode(auth_string.encode('utf-8')).decode('utf-8')
+    headers = {
+        'X-Trino-User': user,
+        'Authorization': f'Basic {auth_base64}'
+    }
+    
+    # 2. On esquive les erreurs de certificat de la banque
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    # 3. L'envoi via urllib (L'outil intégré de base dans Python)
+    req = urllib.request.Request(url, data=query.encode('utf-8'), headers=headers, method='POST')
+    # ... suite du code gérant la réponse
+```
+**Comment ça marche ?**
+Ici, on remplace le "langage base de données" (JDBC) par le "langage internet" (HTTP REST). On package la requête SQL comme si c'était une page web qu'on envoyait au serveur. On utilise `urllib` parce que c'est une librairie fondatrice de Python : elle est **toujours** là, même sur les images Docker les plus verrouillées de la banque.
+
+#### Bloc N°2 : L'interception du flux Spark (`foreachBatch`)
+Puisqu'on ne peut plus dire à Spark *"Prends ce flux et écris-le en JDBC"*, on doit dire à Spark *"Arrête-toi toutes les 5 secondes, donne-moi les données, et je les envoie moi-même avec ma fonction Python"*.
+
+```python
+# ==========================================
+# LE CONTOURNEMENT N°2 : L'INTERCEPTION DU STREAM
+# ==========================================
+def push_to_starburst_via_python(df, batch_id):
+    # 1. On "décharge" les données de la RAM de Spark vers la RAM de Python
+    rows = df.collect() 
+    
+    if len(rows) > 0:
+        # 2. On construit la requête SQL manuellement (Ce que le driver JDBC faisait en cachette)
+        values_list = []
+        for row in rows:
+            t3_str = row.dh_poc_spark_read_timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            values_list.append(f"('{row.id}', '{row.time}', '{row.dh_poc_gen_timestamp}', TIMESTAMP '{t3_str}', CAST(CURRENT_TIMESTAMP AS TIMESTAMP(3)))")
+            
+        values_string = ",\n".join(values_list)
+        sql_query = f"INSERT INTO dh_poc_ice.pocspark.cloudevent_direct (...) VALUES {values_string}"
+        
+        # 3. On appelle notre connecteur Python HTTP au lieu du connecteur Java
+        execute_trino_query_natively(sql_query, TRINO_HOST, TRINO_PORT, STARBURST_USER, STARBURST_PASS)
+
+# 4. Le "foreachBatch" est la commande qui permet d'exécuter notre code Python 
+# sur chaque bloc de données généré par Spark Streaming.
+query = df_processed.writeStream \
+    .foreachBatch(push_to_starburst_via_python) \
+    .start()
+```
+**Comment ça marche ?**
+La méthode `.foreachBatch()` est la porte de sortie de secours de Spark. Elle permet de sortir du moteur distribué le temps de lancer un script personnalisé. 
+Le `df.collect()` récupère les données traitées par les différents nœuds Spark et les rapatrie sur le "Driver" (le chef d'orchestre Python). Une fois qu'on a ces lignes, on construit un gros texte SQL (l'`INSERT INTO`), et on l'envoie à la fonction du Bloc 1.
+
+---
+
+Est-ce que tu vas devoir présenter ces arguments lors d'un comité d'architecture, ou est-ce principalement pour documenter proprement ton dépôt Git ?
+
 C'est un grand classique des Data Lakes ! Tu viens de te heurter à l'une des différences majeures entre une base de données relationnelle classique (comme PostgreSQL ou Oracle) et un moteur de Data Lake distribué (comme Starburst/Trino sur Iceberg).
 
 ### Pourquoi ça ne marche pas ?
