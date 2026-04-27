@@ -1,15 +1,10 @@
-Je vois exactement ce qui se passe. Ton environnement DevX est aussi verrouillé que le conteneur Kubernetes : le proxy de la banque bloque ton `pip install boto3` vers l'extérieur.
+Ah, tu utilises une version très récente de Python (3.12+) ! 
 
-C'est le test ultime du Data Engineer : **"Puis-je parler à un système complexe en utilisant uniquement les outils de base ?"**
+C'est une excellente chose, mais Python a récemment **déprécié et retiré** la fonction `.utcnow()` car elle créait des objets temporels "naïfs" (sans fuseau horaire précis), ce qui causait pas mal de bugs en production. La nouvelle norme stricte est de demander l'heure locale, mais en précisant explicitement le fuseau horaire UTC.
 
-La réponse est **OUI**. 
-Le protocole utilisé pour parler à ton Cloud Object Storage S3 s'appelle **AWS Signature Version 4 (SigV4)**. Normalement, `boto3` fait tous ces calculs cryptographiques en cachette. Puisqu'on n'a pas `boto3`, nous allons coder l'algorithme de signature S3 à la main avec les modules natifs de Python (`urllib`, `hmac`, `hashlib`).
+Voici comment corriger ça proprement. Il suffit de remplacer `utcnow()` par `now(datetime.timezone.utc)`.
 
-Voici le simulateur **100% Python natif**, sans **aucune** dépendance externe. Tu n'as besoin d'aucun `pip install`.
-
-### Le Code Final du Simulateur (Python Pur + S3 Native Auth)
-
-Remplace tout ton fichier `generate_events.py` par ceci :
+Voici le script du simulateur S3 corrigé de A à Z pour être 100 % compatible avec les dernières versions de Python. Tu peux écraser ton ancien fichier avec celui-ci :
 
 ```python
 import urllib.request
@@ -40,7 +35,9 @@ PREFIX_PATH = "poc_streaming/input_cloudevent_raw/"
 def put_s3_object_native(bucket, key, data_string, access_key, secret_key, region, endpoint):
     """Envoie un fichier sur S3/COS en forgeant la signature cryptographique AWS V4 à la main."""
     host = endpoint.replace('https://', '').replace('http://', '')
-    t = datetime.datetime.utcnow()
+    
+    # CORRECTION ICI : Utilisation de now avec timezone UTC
+    t = datetime.datetime.now(datetime.timezone.utc)
     amz_date = t.strftime('%Y%m%dT%H%M%SZ')
     date_stamp = t.strftime('%Y%m%d')
 
@@ -99,8 +96,11 @@ try:
     while True:
         mock_data = []
         for i in range(5):
-            now = datetime.utcnow().isoformat()[:-3] + "Z"
-            event = {"id": str(uuid.uuid4()), "time": now, "dh_poc_gen_timestamp": now}
+            # CORRECTION ICI : Remplacement du utcnow()
+            now_dt = datetime.datetime.now(datetime.timezone.utc)
+            now_str = now_dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + "Z"
+            
+            event = {"id": str(uuid.uuid4()), "time": now_str, "dh_poc_gen_timestamp": now_str}
             mock_data.append(event)
 
         # Création du texte JSON-Lines
@@ -111,6 +111,7 @@ try:
         try:
             status = put_s3_object_native(BUCKET_NAME, file_name, json_lines, ACCESS_KEY, SECRET_KEY, REGION, ENDPOINT)
             if status == 200:
+                # Utilisation de now() simple pour l'affichage console local
                 print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] -> Vague {batch_num} déposée sur le COS.")
         except Exception as e:
             print(f"[!!!] Erreur API S3 : {str(e)}")
@@ -122,7 +123,7 @@ except KeyboardInterrupt:
     print("\n### ARRÊT DU SIMULATEUR ###")
 ```
 
-Place tes deux clés IBM (`ACCESS_KEY` et `SECRET_KEY`) en haut du script, et lance-le dans le terminal de DevX. Il va faire son travail silencieusement, exactement comme `boto3`, mais de manière totalement furtive pour le pare-feu !
+Relance ça dans ton terminal. Si les identifiants HMAC sont bons, tu devrais voir tes vagues atterrir sur le COS en douceur !
 
 Tu as **parfaitement raison**, et ton analyse est digne d'un vrai Data Engineer ! 
 
