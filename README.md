@@ -1,3 +1,160 @@
+Si le dossier `checkpoint` se remplit mais que rien n'apparaît dans Starburst (et aucun fichier Parquet sur le COS dans le dossier de la table), c'est que le pipeline "tourne à vide" ou qu'une erreur silencieuse bloque l'écriture finale.
+
+Voici les 3 causes probables et le code révisé pour débloquer la situation :
+
+1.  **Le syndrome du Checkpoint fantôme :** Si tu as relancé le code plusieurs fois, Spark a mémorisé dans le dossier `checkpoint` qu'il a déjà lu les fichiers présents sur le S3. Il attend donc de **nouveaux** fichiers pour travailler. **Solution : Supprime le dossier checkpoint sur ton S3 avant de relancer.**
+2.  **Le Schéma muet :** Si le format JSON des fichiers déposés par le générateur ne correspond pas *exactement* (majuscules/minuscules) au schéma défini dans Spark, Spark ne plante pas : il crée des lignes vides (`null`). Le `if nb_lignes > 0` passe, mais l'`INSERT` n'envoie rien d'utile.
+3.  **L'erreur Trino non captée :** Si la première réponse de l'API Trino contient une erreur (ex: mauvaise table), mon précédent code ne la vérifiait pas assez tôt.
+
+### 1. Visualisation du Flux et Points de Blocage
+Pour comprendre où la donnée s'arrête, voici le schéma interactif de ton pipeline. Clique sur chaque étape pour voir les tests à effectuer.
+
+```json?chameleon
+{"component":"LlmGeneratedComponent","props":{"height":"700px","prompt":"Create an interactive pipeline debugger for a Data Streaming architecture (Generator -> S3 Raw -> Spark -> Starburst -> S3 Refined). \n\nLogic:\n1. The user sees 4 stages in a horizontal or vertical flow.\n2. Stage 1: Generator (Python). Check: 'Clés HMAC valides ?'. \n3. Stage 2: S3 Raw (JSON Files). Check: 'Fichiers présents dans /input_cloudevent_raw/ ?'.\n4. Stage 3: Spark Streaming. Check: 'Checkpoint supprimé ?', 'nb_lignes > 0 dans les logs ?'.\n5. Stage 4: Starburst/Iceberg. Check: 'Permissions INSERT ?', 'Dossier /data/ créé sur S3 ?'.\n\nInteraction: When a stage is clicked, display a diagnostic checklist below the flow. \nInclude a 'Simulate Failure' toggle for each stage that visually changes the flow color (e.g., turning a segment grey or dashed) to explain common issues like 'Checkpoint stale' or 'Auth 401'.","id":"im_5de3d3451e6a84dc"}}
+```
+
+---
+
+### 2. Code Spark Révisé (Version "Debug Total")
+J'ai ajouté des logs massifs pour que tu puisses voir exactement ce que Spark lit dans sa console.
+
+```python
+import sys
+import time
+import json
+import ssl
+import urllib.request
+import base64 
+from datetime import datetime
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import current_timestamp, col
+from pyspark.sql.types import StructType, StructField, StringType
+
+# ==========================================
+# 1. CONFIGURATIONS
+# ==========================================
+STARBURST_USER = "ton_identifiant" 
+STARBURST_PASS = "ton_mot_de_passe" 
+
+S3_ENDPOINT = "https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud"
+S3_RAW_PATH = "s3a://bu002i004226/poc_streaming/input_cloudevent_raw/"
+
+# ASTUCE : On change le nom du checkpoint à chaque fois pour forcer la relecture complète
+run_id = int(time.time())
+CHECKPOINT_PATH = f"s3a://bu002i004226/poc_streaming/checkpoint_debug_{run_id}/"
+
+TRINO_HOST = "starburst-ap26761-dev-05b792a6.data.cloud.net.intra"
+TRINO_PORT = 443
+
+# ==========================================
+# 2. INITIALISATION SPARK
+# ==========================================
+spark = SparkSession.builder \
+    .appName("PoC-Debug-Streaming") \
+    .config("spark.hadoop.fs.s3a.endpoint", S3_ENDPOINT) \
+    .config("spark.hadoop.fs.s3a.path.style.access", "true") \
+    .getOrCreate()
+    
+spark.sparkContext.setLogLevel("WARN")
+
+schema_events = StructType([
+    StructField("id", StringType(), True),
+    StructField("time", StringType(), True),
+    StructField("dh_poc_gen_timestamp", StringType(), True)
+])
+
+# ==========================================
+# 3. FONCTION API TRINO (Version Robuste)
+# ==========================================
+def execute_trino_query_natively(query, host, port, user, password):
+    url = f"https://{host}:{port}/v1/statement"
+    auth_base64 = base64.b64encode(f"{user}:{password}".encode('utf-8')).decode('utf-8')
+    headers = {'X-Trino-User': user, 'Authorization': f'Basic {auth_base64}'}
+    
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    req = urllib.request.Request(url, data=query.encode('utf-8'), headers=headers, method='POST')
+    try:
+        with urllib.request.urlopen(req, context=ctx) as response:
+            res_data = json.loads(response.read().decode('utf-8'))
+            
+            # VERIFICATION IMMEDIATE DE L'ERREUR
+            if 'error' in res_data:
+                raise Exception(f"Erreur Trino immédiate : {res_data['error']['message']}")
+                
+            # Attente de la fin du traitement
+            while 'nextUri' in res_data:
+                req_next = urllib.request.Request(res_data['nextUri'], headers=headers, method='GET')
+                with urllib.request.urlopen(req_next, context=ctx) as response_next:
+                    res_data = json.loads(response_next.read().decode('utf-8'))
+                    if 'error' in res_data:
+                        raise Exception(f"Erreur SQL Trino : {res_data['error']['message']}")
+            return True
+    except urllib.error.HTTPError as e:
+        raise Exception(f"Erreur HTTP {e.code}: {e.read().decode()}")
+
+# ==========================================
+# 4. STREAMING AVEC LOGS
+# ==========================================
+df_stream = spark.readStream.format("json").schema(schema_events).load(S3_RAW_PATH)
+
+df_processed = df_stream.select(
+    col("id"),
+    col("time"),
+    col("dh_poc_gen_timestamp"),
+    current_timestamp().cast("timestamp").alias("dh_poc_spark_read_timestamp")
+)
+
+def push_to_starburst_via_python(df, batch_id):
+    # LOG DE DEBUG : On vérifie si Spark a vraiment trouvé des lignes
+    nb_lignes = df.count()
+    print(f"\n--- [BATCH {batch_id}] Début du traitement. Lignes trouvées : {nb_lignes} ---")
+    
+    if nb_lignes > 0:
+        rows = df.collect()
+        # On affiche la première ligne pour vérifier que ce n'est pas du "null"
+        print(f"DEBUG: Exemple de donnée lue: {rows[0]}")
+        
+        values_list = []
+        for row in rows:
+            # Sécurité si une colonne est nulle
+            if row.id is None: continue 
+            t3_str = row.dh_poc_spark_read_timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            values_list.append(f"('{row.id}', '{row.time}', '{row.dh_poc_gen_timestamp}', TIMESTAMP '{t3_str}', CAST(CURRENT_TIMESTAMP AS TIMESTAMP(3)))")
+            
+        if not values_list: 
+            print("ATTENTION: Toutes les lignes lues étaient vides (null). Vérifiez le format JSON.")
+            return
+
+        values_string = ",\n".join(values_list)
+        sql_query = f"INSERT INTO dh_poc_ice.pocspark.cloudevent_direct (id, time, dh_poc_gen_timestamp, dh_poc_spark_read_timestamp, dh_poc_starburst_receive_timestamp) VALUES {values_string}"
+        
+        try:
+            execute_trino_query_natively(sql_query, TRINO_HOST, TRINO_PORT, STARBURST_USER, STARBURST_PASS)
+            print(f"SUCCÈS: {len(values_list)} lignes insérées dans Starburst.")
+        except Exception as e:
+            print(f"ERREUR LORS DE L'INSERTION: {str(e)}", file=sys.stderr)
+    else:
+        print(f"INFO: Batch {batch_id} vide. Spark n'a pas vu de nouveaux fichiers.")
+
+query = df_processed.writeStream \
+    .foreachBatch(push_to_starburst_via_python) \
+    .option("checkpointLocation", CHECKPOINT_PATH) \
+    .trigger(processingTime="5 seconds") \
+    .start()
+
+query.awaitTermination()
+```
+
+### 3. Checklist de déblocage rapide :
+
+1.  **Le test "S3 Raw" :** Va sur ton bucket COS dans le dossier `input_cloudevent_raw/`. Y a-t-il des fichiers récents ? Si non, ton générateur a un problème de clés.
+2.  **Le test "JSON Content" :** Ouvre un de ces fichiers. Contient-il bien `{"id": "...", "time": "...", ...}` ? Si les noms de colonnes sont différents (ex: `ID` au lieu de `id`), Spark ne les lira pas.
+3.  **Le test "Checkpoint" :** Avant de relancer mon code ci-dessus, supprime manuellement le dossier `checkpoint_direct_...` sur ton S3. C'est la cause de 90% des problèmes où "rien ne se passe".
+4.  **Le test "Starburst Data" :** Une fois que le code affiche `SUCCÈS`, va sur Starburst et fais un `SELECT count(*) FROM dh_poc_ice.pocspark.cloudevent_direct`. Si le chiffre augmente, c'est gagné ! Les fichiers Parquet sur S3 peuvent mettre quelques secondes à apparaître dans le dossier `data/` car Iceberg attend de fermer son "manifest file".
+
 Ah, tu utilises une version très récente de Python (3.12+) ! 
 
 C'est une excellente chose, mais Python a récemment **déprécié et retiré** la fonction `.utcnow()` car elle créait des objets temporels "naïfs" (sans fuseau horaire précis), ce qui causait pas mal de bugs en production. La nouvelle norme stricte est de demander l'heure locale, mais en précisant explicitement le fuseau horaire UTC.
