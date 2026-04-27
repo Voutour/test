@@ -1,3 +1,121 @@
+Passer d'un script Bash (`.sh`) à une véritable **orchestration par API en Python**, c'est l'étape finale pour intégrer ton traitement dans une vraie chaîne automatisée (CI/CD, Airflow, ou ordonnanceur maison).
+
+Puisque nous savons que ton environnement DevX bloque les `pip install` externes, nous allons construire ce programme d'orchestration en **Python pur**, en utilisant la librairie native `urllib` pour faire les requêtes HTTP (REST) vers l'API de ton cluster Spark (généralement Apache Livy).
+
+Voici le programme complet. Il va faire un `POST` pour envoyer le job, puis faire des `GET` réguliers pour surveiller son statut.
+
+### Le Programme Orchestrateur (`lanceur_api.py`)
+
+Ce script est à lancer directement depuis ton IDE DevX.
+
+```python
+import json
+import urllib.request
+import ssl
+import time
+import base64
+
+# ==========================================
+# 1. CONFIGURATIONS DE L'API
+# ==========================================
+# ⚠️ Remplace par l'URL exacte de l'API REST Spark de ton entreprise (Livy)
+SPARK_API_URL = "https://spark-api-cluster.data.cloud.net.intra/batches"
+
+# Identifiants techniques pour appeler l'API
+API_USER = "ton_user_technique"
+API_PASS = "ton_token_ou_password"
+
+# ==========================================
+# 2. LE PAYLOAD (La configuration du Job)
+# ==========================================
+# C'est la traduction exacte de ton submit_sparktacus.sh en format JSON
+livy_payload = {
+    # Le chemin de ton code principal (qu'il faut d'abord uploader sur le COS)
+    "file": "s3a://bu002i004226/poc_streaming/scripts/main_cloudevent.py",
+    "name": "PoC-Streaming-API-Launch",
+    "conf": {
+        # Les paramètres vitaux issus de ton fichier .sh
+        "spark.kubernetes.container.image": "private.fr2.icr.io/xxx/spark-bnpp:3.4-3.0", # À adapter avec ton chemin complet
+        "spark.ui.enabled": "true",
+        "spark.hadoop.fs.s3a.endpoint": "https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud",
+        "spark.hadoop.fs.s3a.path.style.access": "true"
+    }
+}
+
+# ==========================================
+# 3. FONCTIONS D'APPEL API (Natives)
+# ==========================================
+def call_spark_api(method, endpoint, payload=None):
+    """Génère l'appel HTTP natif vers l'API du cluster."""
+    auth_base64 = base64.b64encode(f"{API_USER}:{API_PASS}".encode('utf-8')).decode('utf-8')
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Basic {auth_base64}'
+    }
+    
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    data = json.dumps(payload).encode('utf-8') if payload else None
+    req = urllib.request.Request(endpoint, data=data, headers=headers, method=method)
+    
+    with urllib.request.urlopen(req, context=ctx) as response:
+        return json.loads(response.read().decode('utf-8'))
+
+# ==========================================
+# 4. EXÉCUTION ET SURVEILLANCE
+# ==========================================
+if __name__ == "__main__":
+    print("### 1. SOUMISSION DU JOB SPARK VIA API ###")
+    try:
+        response = call_spark_api('POST', SPARK_API_URL, livy_payload)
+        job_id = response.get('id')
+        print(f"-> Job soumis avec succès ! ID attribué : {job_id}")
+        
+    except Exception as e:
+        print(f"[!!!] Erreur lors de la soumission : {str(e)}")
+        exit(1)
+
+    print("\n### 2. SURVEILLANCE DU STATUT DU JOB ###")
+    status_endpoint = f"{SPARK_API_URL}/{job_id}"
+    
+    # Boucle de surveillance (Polling)
+    try:
+        while True:
+            status_response = call_spark_api('GET', status_endpoint)
+            state = status_response.get('state', 'UNKNOWN')
+            
+            # Les statuts Livy standards : starting, running, success, dead
+            if state in ['starting', 'running']:
+                print(f"[Statut] Le job est '{state}'. En attente...")
+                time.sleep(10) # On vérifie toutes les 10 secondes
+                
+            elif state == 'success':
+                print("\n[OK] Le job a terminé son exécution avec succès !")
+                break
+                
+            elif state in ['dead', 'error', 'killed']:
+                print(f"\n[!!!] Le job a échoué avec le statut : {state}")
+                # Affichage des logs d'erreur si l'API les renvoie
+                if 'log' in status_response:
+                    print("\n".join(status_response['log']))
+                break
+                
+            else:
+                print(f"Statut inattendu : {state}")
+                time.sleep(10)
+                
+    except KeyboardInterrupt:
+        print("\nSurveillance arrêtée. (Le job continue de tourner sur le cluster).")
+```
+
+### Ce qu'il te faut pour le faire fonctionner :
+
+1. **L'URL de l'API (`SPARK_API_URL`) :** Dans ton fichier `.sh`, la commande `spark-submit` communique avec un serveur ("Master"). C'est l'URL REST de ce serveur (souvent Livy) qu'il faut renseigner ici.
+2. **Le fichier principal sur le COS :** Ton script `main_cloudevent.py` doit physiquement être sur ton S3 (comme renseigné dans la variable `"file"` du payload), car le cluster Kubernetes ira le lire directement là-bas au démarrage.
+3. **Le tag exact de l'image Docker :** N'oublie pas de recopier le chemin complet de `spark.kubernetes.container.image` qui est dans ton script `.sh` originel pour que le cluster sache quel environnement conteneurisé lancer.
+
 Si le dossier `checkpoint` se remplit mais que rien n'apparaît dans Starburst (et aucun fichier Parquet sur le COS dans le dossier de la table), c'est que le pipeline "tourne à vide" ou qu'une erreur silencieuse bloque l'écriture finale.
 
 Voici les 3 causes probables et le code révisé pour débloquer la situation :
