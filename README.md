@@ -1,90 +1,86 @@
-C'est la méthode "Commando" des Data Engineers : simple, légère et diablement efficace. 
+C'est la question parfaite. Si l'équipe infrastructure n'a pas ouvert Livy (ou si tu n'as pas l'URL), on sort l'arme absolue du développeur Python : le module **`subprocess`**.
 
-Tu vas recréer exactement ce que fait Airflow sous le capot, mais avec un simple script de 30 lignes en Python pur (sans aucune dépendance, ni compte de service, ni configuration lourde).
+Puisque tu m'as prouvé avec tes captures d'écran que tu avais un fichier **`submit_sparktacus.sh`** qui fonctionnait très bien dans ton terminal bash, on va tout simplement utiliser Python pour "cliquer" sur ce script à ta place !
 
-Dans les environnements Big Data, l'API REST standard pour lancer des jobs Spark s'appelle **Apache Livy**. Au lieu de faire un `spark-submit` dans un terminal bash, tu envoies un JSON (le payload) à l'API Livy qui s'occupe de créer le pod Kubernetes pour toi.
+C'est la méthode la plus robuste car **elle ne demande aucune configuration supplémentaire** : elle utilise exactement les mêmes droits, les mêmes proxys et le même environnement que ton terminal DevX habituel.
 
-Voici le script Python (ton mini-orchestrateur) à lancer depuis ton DevX. 
+Voici ton mini-orchestrateur en Python pur.
 
-### Le script de lancement API (`trigger_spark_api.py`)
+### Le script de lancement natif (`trigger_spark_local.py`)
 
-Crée ce fichier dans DevX. Tu pourras le lancer en faisant simplement `python trigger_spark_api.py`.
+Crée ce fichier dans ton DevX, dans le même dossier que ton script `submit_sparktacus.sh`.
 
 ```python
-import urllib.request
-import json
-import ssl
+import subprocess
+import sys
+import time
 
 # ==========================================
-# 1. L'ADRESSE DE L'API SPARK
+# 1. CONFIGURATION
 # ==========================================
-# C'est l'URL d'entrée de ton cluster Kubernetes/Spark. 
-# Si tu ne l'as pas, demande à ton équipe infra : "Quelle est l'URL de l'API REST (Livy) pour soumettre un batch ?"
-SPARK_API_URL = "https://api-spark.data.cloud.net.intra/batches" 
+# Le chemin exact vers ton script bash qui contient la commande spark-submit
+SCRIPT_BASH = "./submit_sparktacus.sh"
 
 # ==========================================
-# 2. LE PAYLOAD (La traduction de ton script bash)
+# 2. L'ORCHESTRATEUR (Subprocess)
 # ==========================================
-# On met ici exactement les mêmes paramètres que dans ton ancien submit_sparktacus.sh
-payload = {
-    # ⚠️ N'oublie pas d'uploader ton main_cloudevent.py sur le S3 avant !
-    "file": "s3a://bu002i004226/poc_streaming/scripts/main_cloudevent.py",
-    "name": "Sparktacus-Streaming-API",
-    "conf": {
-        # L'image Docker de la banque (récupérée de ton script sh)
-        "spark.kubernetes.container.image": "private.fr2.icr.io/bnp-g-containers-bndn1p/spark-bnpp:3.4-3.0",
-        "spark.ui.enabled": "true",
-        "spark.sql.shuffle.partitions": "4"
-    }
-}
-
-# ==========================================
-# 3. L'APPEL API (POST)
-# ==========================================
-print(f"### Envoi de la requête de lancement à {SPARK_API_URL}... ###")
-
-req = urllib.request.Request(
-    SPARK_API_URL, 
-    data=json.dumps(payload).encode('utf-8'), 
-    headers={'Content-Type': 'application/json', 'X-Requested-By': 'devx-user'}, 
-    method='POST'
-)
-
-# Contournement des certificats SSL internes
-ctx = ssl.create_default_context()
-ctx.check_hostname = False
-ctx.verify_mode = ssl.CERT_NONE
+print(f"### Démarrage de l'orchestrateur Python ###")
+print(f"-> Lancement du script : {SCRIPT_BASH}\n")
+print("-" * 50)
 
 try:
-    with urllib.request.urlopen(req, context=ctx) as response:
-        # L'API nous répond avec les infos du job fraîchement créé
-        result = json.loads(response.read().decode('utf-8'))
-        print("\n✅ SUCCÈS ! Le cluster a accepté la mission.")
-        print("--------------------------------------------------")
-        print(f"-> ID du Job (Batch ID) : {result.get('id')}")
-        print(f"-> Application ID       : {result.get('appId', 'En cours d\'attribution...')}")
-        print(f"-> Statut actuel        : {result.get('state')}")
-        print("--------------------------------------------------")
-        print("Tu peux maintenant aller vérifier dans les logs Kubernetes ou Spark UI !")
+    # Popen permet de lancer le script et de lire ce qu'il affiche en temps réel
+    process = subprocess.Popen(
+        [SCRIPT_BASH], 
+        stdout=subprocess.PIPE, 
+        stderr=subprocess.STDOUT, # On fusionne les erreurs et les logs normaux
+        text=True,
+        bufsize=1
+    )
+
+    # Boucle pour lire et afficher les logs de Kubernetes/Spark-submit en direct
+    for ligne in iter(process.stdout.readline, ''):
+        # On nettoie un peu la sortie pour que ce soit lisible
+        print(f"[K8S-SUBMIT] {ligne.strip()}")
         
-except urllib.error.HTTPError as e:
-    print("\n❌ ERREUR HTTP REJETÉE PAR L'API :")
-    print(f"Code : {e.code}")
-    print(e.read().decode('utf-8'))
+    # On attend que le script bash se termine
+    process.stdout.close()
+    return_code = process.wait()
+    print("-" * 50)
+
+    # Analyse du résultat
+    if return_code == 0:
+        print("\n✅ SUCCÈS ! La commande spark-submit a été envoyée au cluster Kubernetes.")
+        print("Le job tourne maintenant en tâche de fond sur l'infrastructure.")
+    else:
+        print(f"\n❌ ERREUR : Le script bash a échoué avec le code de sortie {return_code}.")
+
+except FileNotFoundError:
+    print(f"\n❌ ERREUR INTROUVABLE : Le fichier {SCRIPT_BASH} n'existe pas dans ce dossier.")
+    print("Vérifie que tu lances ce script Python depuis le bon endroit.")
 except Exception as e:
-    print("\n❌ ERREUR DE CONNEXION À L'API :")
-    print(str(e))
+    print(f"\n❌ ERREUR SYSTÈME : {str(e)}")
+
+print("\n### Fin de l'orchestration ###")
 ```
 
-### 💡 Le Plan d'Action pour ton test final :
+### 💡 Ton plan de vol final (Le test ultime) :
 
-1. **Upload :** Prends ton code `main_cloudevent.py` (le Spark propre qui fait le push vers Starburst) et dépose-le sur ton bucket COS.
-2. **Trouve l'URL :** Demande à un collègue ou vérifie dans la documentation de ton portail DevX quelle est l'URL de l'API de soumission Spark (très souvent `/batches` à la fin). Remplace-la ligne 10.
-3. **Lance le trigger :** Fais `python trigger_spark_api.py`. Dès qu'il te dit **SUCCÈS**, ton pod Kubernetes est en train de s'allumer tout seul en arrière-plan.
-4. **Lance le générateur :** Dans un autre terminal DevX, fais tourner ton simulateur `generate_events.py` pour bombarder le COS de fichiers JSON.
-5. **Observe la magie :** Va sur DBeaver ou l'UI de Starburst et regarde ton `T4` se calculer en temps réel.
+Pour tester ta latence avec cette méthode, tu n'as besoin que de deux terminaux ouverts dans ton DevX :
 
-*(Note de secours : Si ton équipe d'infrastructure te dit qu'ils n'ont pas ouvert d'API REST/Livy et que le `spark-submit` en bash est la SEULE porte d'entrée autorisée par la sécurité, tu pourras toujours lancer ton bash depuis un script Python via le module `subprocess`. Mais l'approche API au-dessus est de loin la plus propre).*
+**Terminal 1 (L'orchestrateur / Le flux) :**
+1. Lance `python trigger_spark_local.py`.
+2. Python va exécuter ton script bash, qui va lui-même demander à Kubernetes de lancer ton job Spark (`main_cloudevent.py`).
+3. Attends de voir le message **✅ SUCCÈS**. À partir de là, Spark écoute le COS en silence.
+
+**Terminal 2 (Le générateur / La source) :**
+1. Lance `python generate_events.py` (le script avec la sécurité AWS native).
+2. Laisse-le envoyer 3 ou 4 "vagues" de fichiers JSON sur le COS, puis coupe-le (Ctrl+C).
+
+**La validation (La cible) :**
+1. Va sur l'interface web de Starburst ou DBeaver.
+2. Fais ton `SELECT * FROM dh_poc_ice.pocspark.cloudevent_direct`.
+3. Tu verras tes données avec un T1, T2, T3 et T4 parfaitement décalés de quelques millisecondes/secondes, prouvant que la donnée a voyagé à travers toute l'architecture de la banque !
 
 Si le dossier `checkpoint` se remplit mais que rien n'apparaît dans Starburst (et aucun fichier Parquet sur le COS dans le dossier de la table), c'est que le pipeline "tourne à vide" ou qu'une erreur silencieuse bloque l'écriture finale.
 
