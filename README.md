@@ -1,3 +1,97 @@
+C'est le grand classique du Big Data en environnement local ! Ton erreur `java.lang.ClassNotFoundException: Class org.apache.hadoop.fs.s3a.S3AFileSystem not found` est tout à fait normale.
+
+### Pourquoi ça plante ici et pas sur l'autre script ?
+
+Quand tu as lancé le job principal avec `./submit_sparktacus.sh`, ton code est parti s'exécuter sur les serveurs Kubernetes de la banque. L'équipe d'infrastructure a créé une image Docker parfaite qui contient déjà toutes les librairies Java (`hadoop-aws.jar`) et qui injecte automatiquement tes mots de passe COS.
+
+Mais là, tu as lancé `python generate_events.py` directement dans le terminal de ton IDE DevX. C'est un environnement "nu". Ton PySpark local n'a pas les librairies Java pour parler au protocole `s3a://`, et il n'a pas tes identifiants de connexion au bucket.
+
+### La Solution : Abandonner Spark pour le Générateur
+
+En ingénierie de la donnée, utiliser PySpark (un moteur distribué massif qui lance une machine virtuelle Java) pour générer 5 petites lignes de JSON, c'est comme utiliser un semi-remorque pour livrer une pizza. 
+
+Puisque ce script n'est qu'un simulateur, **nous allons le faire en Python pur**, en utilisant la librairie `boto3` (le standard pour interagir avec les buckets S3/COS en Python). Ça contourne totalement Java et ses problèmes de `.jar` !
+
+### Le Code du Générateur (100% Python Pur)
+
+Remplace le contenu de ton `generate_events.py` par ceci. 
+*(Assure-toi d'avoir fait un `pip install boto3` dans ton terminal DevX si ce n'est pas déjà fait).*
+
+```python
+import time
+import uuid
+import json
+import boto3
+from datetime import datetime
+
+# ==========================================
+# CONFIGURATIONS
+# ==========================================
+S3_ENDPOINT = "https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud"
+BUCKET_NAME = "bu002i004226"
+PREFIX_PATH = "poc_streaming/input_cloudevent_raw/"
+
+# ⚠️ Tu dois renseigner tes clés d'accès techniques au COS ici
+# Ce sont les clés qui correspondent au "COS_SECRET_NAME" de ton script bash
+ACCESS_KEY = "TON_ACCESS_KEY"
+SECRET_KEY = "TON_SECRET_KEY"
+
+# Connexion directe au Cloud Object Storage
+s3_client = boto3.client('s3',
+    endpoint_url=S3_ENDPOINT,
+    aws_access_key_id=ACCESS_KEY,
+    aws_secret_access_key=SECRET_KEY
+)
+
+print("### DÉMARRAGE DU SIMULATEUR DE FLUX CONTINU (PYTHON PUR) ###")
+print("Appuyez sur Ctrl+C pour arrêter la génération.\n")
+
+batch_num = 1
+try:
+    while True:
+        mock_data = []
+        # On simule l'arrivée de 5 événements
+        for i in range(5):
+            now = datetime.utcnow().isoformat()[:-3] + "Z"
+            event = {
+                "id": str(uuid.uuid4()),
+                "time": now,
+                "dh_poc_gen_timestamp": now
+            }
+            mock_data.append(event)
+
+        # Spark Streaming attend un format "JSON-Lines" (une ligne de texte = un objet JSON)
+        json_lines = "\n".join([json.dumps(record) for record in mock_data])
+        
+        # On crée un nom de fichier unique pour cette vague
+        file_name = f"{PREFIX_PATH}vague_{batch_num}_{int(time.time())}.json"
+        
+        # Envoi direct du texte sur le bucket
+        s3_client.put_object(
+            Bucket=BUCKET_NAME, 
+            Key=file_name, 
+            Body=json_lines
+        )
+        
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] -> Vague {batch_num} déposée sur le COS ({file_name}).")
+        batch_num += 1
+        
+        # On attend 4 secondes avant la vague suivante
+        time.sleep(4) 
+        
+except KeyboardInterrupt:
+    print("\n### ARRÊT DU SIMULATEUR ###")
+except Exception as e:
+    print(f"\n[!!!] Erreur de connexion au COS : {str(e)}")
+```
+
+### La seule chose qu'il te manque :
+
+Pour que ce script fonctionne, tu dois remplacer `"TON_ACCESS_KEY"` et `"TON_SECRET_KEY"` par tes vrais identifiants techniques IBM Cloud (Hmac). 
+Puisque ton script bash `submit_sparktacus.sh` arrive à s'y connecter, tu devrais pouvoir retrouver ces clés sur ton portail IBM Cloud (dans la section "Service Credentials" de ton Object Storage) ou dans ton gestionnaire de secrets.
+
+Une fois que tu as mis les clés, relance ton `python generate_events.py` dans le terminal. Il va envoyer ses fichiers en silence, et ton job Kubernetes Sparktacus va les gober en temps réel !
+
 Tu as **parfaitement raison**, et ton analyse est digne d'un vrai Data Engineer ! 
 
 L'image que tu as envoyée montre une belle réussite technique (la donnée arrive bien de bout en bout), mais elle met aussi en lumière le biais de notre test : puisque tout a été généré et envoyé dans la même fraction de seconde par le même script, la latence est virtuellement nulle. Les T1, T2, T3 et T4 sont agglutinés.
