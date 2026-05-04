@@ -1,3 +1,146 @@
+C'est un excellent choix. En utilisant le **Cloud Object Storage (COS)** comme zone tampon (Buffer), tu respectes l'architecture cible de la banque tout en activant le **vrai moteur de streaming de Spark**.
+
+Voici comment l'architecture va fonctionner :
+1.  **La Médiation (API Python) :** Elle expose un endpoint HTTP. Quand elle reçoit un événement, elle le transforme instantanément en un petit fichier JSON qu'elle dépose sur le COS. C'est l'appel API "synchrone".
+2.  **Le Streaming (Spark) :** Le code Spark est soumis une seule fois et tourne en boucle. Il utilise `readStream` pour surveiller le dossier du COS. Dès qu'un fichier apparaît, il le traite.
+
+### 1. Le flux de données et les Timestamps (T1 à T4)
+
+Pour bien valider ton PoC, il est crucial de comprendre où chaque "T" est généré dans cette chaîne.
+
+```json?chameleon
+{"component":"LlmGeneratedComponent","props":{"height":"600px","prompt":"Crée un visualiseur interactif de pipeline de données pour un PoC d'observabilité. \n\nLogic:\n1. Affichez 4 blocs : Client -> Médiation (API) -> Spark (Streaming) -> Starburst (Iceberg).\n2. Entre chaque bloc, une flèche animée montre le passage de la donnée.\n3. Pour chaque bloc, affichez le timestamp associé :\n   - Client : T1 (Génération)\n   - Médiation : T2 (Écriture S3)\n   - Spark : T3 (Lecture Stream)\n   - Starburst : T4 (Persistance SQL)\n4. Interaction : L'utilisateur peut cliquer sur 'Simuler un événement'. Cela déclenche une animation de la donnée à travers les blocs et affiche un tableau des latences calculées (ex: T3-T2, T4-T1) avec des valeurs réalistes (quelques secondes).","id":"im_a18bdc09216dba2e"}}
+```
+
+---
+
+### 2. Le code de la Médiation API (`mediation_api.py`)
+Ce script tourne sur DevX. Il reçoit les appels API et écrit sur le S3 sans `boto3`.
+
+```python
+import urllib.request
+import datetime
+import hashlib
+import hmac
+import json
+import uuid
+import ssl
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+# --- CONFIG S3 ---
+ACCESS_KEY = "TON_ACCESS_KEY"
+SECRET_KEY = "TON_SECRET_KEY"
+REGION = "eu-fr2"
+ENDPOINT = "https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud"
+BUCKET_NAME = "bu002i004226"
+PREFIX_PATH = "poc_streaming/input_cloudevent_raw/"
+
+def put_s3_native(key, data_string):
+    host = ENDPOINT.replace('https://', '')
+    t = datetime.datetime.now(datetime.timezone.utc)
+    amz_date = t.strftime('%Y%m%dT%H%M%SZ')
+    date_stamp = t.strftime('%Y%m%d')
+    payload_hash = hashlib.sha256(data_string.encode('utf-8')).hexdigest()
+    canonical_uri = f"/{BUCKET_NAME}/{key}"
+    canonical_headers = f"host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"
+    signed_headers = "host;x-amz-content-sha256;x-amz-date"
+    canonical_request = f"PUT\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    string_to_sign = f"AWS4-HMAC-SHA256\n{amz_date}\n{date_stamp}/{REGION}/s3/aws4_request\n{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
+    
+    def sign(key, msg): return hmac.new(key, msg.encode('utf-8'), hashlib.sha256).digest()
+    kDate = sign(('AWS4' + SECRET_KEY).encode('utf-8'), date_stamp)
+    kRegion = sign(kDate, REGION)
+    kService = sign(kRegion, 's3')
+    kSigning = sign(kService, 'aws4_request')
+    signature = hmac.new(kSigning, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
+
+    auth_header = f"AWS4-HMAC-SHA256 Credential={ACCESS_KEY}/{date_stamp}/{REGION}/s3/aws4_request, SignedHeaders={signed_headers}, Signature={signature}"
+    headers = {'x-amz-date': amz_date, 'x-amz-content-sha256': payload_hash, 'Authorization': auth_header}
+    
+    req = urllib.request.Request(f"{ENDPOINT}{canonical_uri}", data=data_string.encode('utf-8'), headers=headers, method='PUT')
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(req, context=ctx) as res: return res.status
+
+class MediationHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        if self.path == '/ingest':
+            length = int(self.headers['Content-Length'])
+            event = json.loads(self.rfile.read(length).decode())
+            
+            # T2 : Date de réception/écriture par la médiation
+            event['dh_poc_gen_timestamp'] = datetime.datetime.now(datetime.timezone.utc).isoformat()[:-3] + "Z"
+            
+            file_name = f"{PREFIX_PATH}event_{int(datetime.datetime.now().timestamp())}_{uuid.uuid4().hex[:6]}.json"
+            status = put_s3_native(file_name, json.dumps(event))
+            
+            self.send_response(200 if status == 200 else 500)
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "ok", "file": file_name}).encode())
+
+print("API de Médiation lancée sur le port 8000...")
+HTTPServer(('0.0.0.0', 8000), MediationHandler).serve_forever()
+```
+
+---
+
+### 3. Le code Spark Streaming (`main_cloudevent.py`)
+C'est lui qui tourne en permanence sur Kubernetes via le `spark-submit`.
+
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, current_timestamp, from_json
+from pyspark.sql.types import StructType, StructField, StringType
+import json, base64, ssl, urllib.request
+
+# --- CONFIG ---
+S3_RAW_PATH = "s3a://bu002i004226/poc_streaming/input_cloudevent_raw/"
+CHECKPOINT = "s3a://bu002i004226/poc_streaming/checkpoint_stream/"
+TRINO_URL = "https://starburst-ap26761-dev-05b792a6.data.cloud.net.intra:443/v1/statement"
+
+spark = SparkSession.builder.appName("Spark-Streaming-S3-to-Starburst").getOrCreate()
+
+schema = StructType([
+    StructField("id", StringType(), True),
+    StructField("time", StringType(), True),
+    StructField("dh_poc_gen_timestamp", StringType(), True)
+])
+
+# VRAI STREAMING : Spark surveille le dossier S3
+df_stream = spark.readStream.format("json").schema(schema).load(S3_RAW_PATH)
+
+def send_to_starburst(df, batch_id):
+    rows = df.collect()
+    if not rows: return
+    
+    values = []
+    for r in rows:
+        # T3 : current_timestamp de Spark
+        t3 = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        values.append(f"('{r.id}', '{r.time}', '{r.dh_poc_gen_timestamp}', TIMESTAMP '{t3}', CURRENT_TIMESTAMP)")
+    
+    sql = f"INSERT INTO dh_poc_ice.pocspark.cloudevent_direct VALUES {','.join(values)}"
+    
+    # Appel Trino Natif (Code simplifié pour l'exemple)
+    auth = base64.b64encode(b"USER:PASS").decode()
+    req = urllib.request.Request(TRINO_URL, data=sql.encode(), headers={"Authorization": f"Basic {auth}", "X-Trino-User": "USER"})
+    ctx = ssl._create_unverified_context()
+    with urllib.request.urlopen(req, context=ctx) as res: print(f"Batch {batch_id} envoyé.")
+
+df_stream.writeStream.foreachBatch(send_to_starburst).option("checkpointLocation", CHECKPOINT).start().awaitTermination()
+```
+
+### 💡 Pourquoi ça va marcher cette fois ?
+1.  **Indépendance :** Ton API de médiation est un simple serveur Python. Elle ne dépend pas de Spark. Elle "pousse" vers le S3.
+2.  **Robustesse :** Si Spark s'arrête 5 minutes, les fichiers s'accumulent sur le S3. Dès que tu relances Spark, il "rattrape" son retard automatiquement grâce au `checkpoint`.
+3.  **Vrai Streaming :** Tu utilises `readStream`. C'est le mode le plus performant pour traiter des milliers d'événements par seconde.
+
+**Action :** 1. Lance le script Spark via ton `submit_sparktacus.sh`.
+2. Lance `mediation_api.py` sur DevX.
+3. Fais un `curl -X POST -d '{"id":"123", "time":"..."}' http://localhost:8000/ingest` pour tester !
+
+
 C'est un excellent choix. L'**Option 2 (Architecture Hybride API -> COS -> Spark Streaming)** est la plus robuste et la plus proche de la réalité industrielle d'une banque.
 
 Dans ce scénario :
