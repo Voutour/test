@@ -1,3 +1,189 @@
+C'est un excellent changement de paradigme ! Tu passes d'une architecture orientée "Fichiers" (Batch/Micro-batch) à une véritable architecture orientée "Événements Réseau" (Streaming pur). 
+
+Cependant, il faut que je sois très candide avec toi sur un point technique fondamental en Big Data : **Spark n'est pas un serveur Web.**
+
+Spark est un moteur de calcul surpuissant, mais il n'a pas été conçu pour héberger des endpoints HTTP (comme `POST /api/events`). Il ne peut pas jouer le rôle d'une API web classique. Dans une vraie architecture de production bancaire, quand un service veut pousser des événements par API, on met toujours un **Message Broker** (comme Kafka ou IBM Event Streams) entre l'API et Spark. L'API pousse dans Kafka, et Spark écoute Kafka en permanence.
+
+### Le "Hack" du PoC : Le port TCP (Spark Native)
+
+Puisque nous voulons éviter d'installer Kafka juste pour un PoC, il existe une fonction native et secrète dans Spark pour faire exactement ce que tu demandes : **le mode `socket`**.
+
+Au lieu d'écouter un dossier sur le COS, on va dire à Spark d'ouvrir un "port réseau" (le port 9999) sur sa propre machine et d'écouter en permanence. Ton générateur ne déposera plus de fichiers, il se connectera directement à ce port via le réseau et "injectera" les données en direct dans la mémoire de Spark.
+
+Voici comment réaliser cette magie en deux scripts, à lancer **tous les deux dans ton terminal DevX** (pour éviter les blocages de pare-feu Kubernetes le temps du test).
+
+---
+
+### 1. Le Serveur Spark (Le Récepteur qui tourne en permanence)
+
+Remplace ton code Spark (`main_cloudevent.py`) par celui-ci. Il ouvre le port 9999 et se met en attente infinie.
+
+```python
+import sys
+import time
+import json
+import ssl
+import urllib.request
+import base64 
+from datetime import datetime
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import from_json, col, current_timestamp
+from pyspark.sql.types import StructType, StructField, StringType
+
+# ==========================================
+# 1. CONFIGURATIONS
+# ==========================================
+STARBURST_USER = "ton_identifiant" 
+STARBURST_PASS = "ton_mot_de_passe" 
+TRINO_HOST = "starburst-ap26761-dev-05b792a6.data.cloud.net.intra"
+TRINO_PORT = 443
+
+# ==========================================
+# 2. INITIALISATION SPARK
+# ==========================================
+spark = SparkSession.builder \
+    .appName("PoC-Spark-Network-Listener") \
+    .getOrCreate()
+    
+spark.sparkContext.setLogLevel("WARN")
+
+# Le schéma de tes données
+schema_events = StructType([
+    StructField("id", StringType(), True),
+    StructField("time", StringType(), True),
+    StructField("dh_poc_gen_timestamp", StringType(), True)
+])
+
+# ==========================================
+# 3. FONCTION API TRINO (Inchangée)
+# ==========================================
+def execute_trino_query_natively(query, host, port, user, password):
+    url = f"https://{host}:{port}/v1/statement"
+    auth_base64 = base64.b64encode(f"{user}:{password}".encode('utf-8')).decode('utf-8')
+    headers = {'X-Trino-User': user, 'Authorization': f'Basic {auth_base64}'}
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    req = urllib.request.Request(url, data=query.encode('utf-8'), headers=headers, method='POST')
+    try:
+        with urllib.request.urlopen(req, context=ctx) as response:
+            res_data = json.loads(response.read().decode('utf-8'))
+            while 'nextUri' in res_data:
+                req_next = urllib.request.Request(res_data['nextUri'], headers=headers, method='GET')
+                with urllib.request.urlopen(req_next, context=ctx) as response_next:
+                    res_data = json.loads(response_next.read().decode('utf-8'))
+            return True
+    except urllib.error.HTTPError as e:
+        raise Exception(f"Erreur HTTP {e.code}: {e.read().decode()}")
+
+# ==========================================
+# 4. STREAMING RÉSEAU (TCP SOCKET)
+# ==========================================
+print("### DÉMARRAGE DU SERVEUR SPARK ###")
+print("-> Écoute réseau activée sur le port 9999...")
+print("-> En attente de connexion du générateur...")
+
+# 🚨 LA MAGIE EST ICI : On écoute le réseau au lieu du COS
+df_raw = spark.readStream.format("socket") \
+    .option("host", "0.0.0.0") \
+    .option("port", 9999) \
+    .load()
+
+# Spark reçoit du texte brut. On le convertit en colonnes JSON.
+df_parsed = df_raw.select(from_json(col("value"), schema_events).alias("data")).select("data.*")
+
+df_processed = df_parsed.select(
+    col("id"),
+    col("time"),
+    col("dh_poc_gen_timestamp"),
+    current_timestamp().cast("timestamp").alias("dh_poc_spark_read_timestamp")
+)
+
+def push_to_starburst(df, batch_id):
+    rows = df.collect()
+    nb_lignes = len(rows)
+    if nb_lignes > 0:
+        values_list = []
+        for row in rows:
+            if row.id is None: continue 
+            t3_str = row.dh_poc_spark_read_timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            values_list.append(f"('{row.id}', '{row.time}', '{row.dh_poc_gen_timestamp}', TIMESTAMP '{t3_str}', CAST(CURRENT_TIMESTAMP AS TIMESTAMP(3)))")
+            
+        values_string = ",\n".join(values_list)
+        sql_query = f"INSERT INTO dh_poc_ice.pocspark.cloudevent_direct (id, time, dh_poc_gen_timestamp, dh_poc_spark_read_timestamp, dh_poc_starburst_receive_timestamp) VALUES {values_string}"
+        
+        try:
+            execute_trino_query_natively(sql_query, TRINO_HOST, TRINO_PORT, STARBURST_USER, STARBURST_PASS)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Batch {batch_id} : {nb_lignes} événements insérés dans Starburst.")
+        except Exception as e:
+            print(f"ERREUR API: {str(e)}")
+
+# Plus besoin de checkpoint S3 pour le réseau !
+query = df_processed.writeStream \
+    .foreachBatch(push_to_starburst) \
+    .start()
+
+query.awaitTermination()
+```
+
+---
+
+### 2. Le Générateur d'Événements (Le Client API)
+
+Crée un fichier `api_simulator.py`. Il n'utilise plus de fichiers ou d'identifiants IBM Cloud. Il se connecte à la mémoire de Spark et lui "parle" en direct.
+
+```python
+import socket
+import time
+import uuid
+import json
+from datetime import datetime, timezone
+
+# On se connecte à l'adresse locale de ton environnement DevX
+HOST = '127.0.0.1' 
+PORT = 9999
+
+print(f"### TENTATIVE DE CONNEXION À SPARK ({HOST}:{PORT}) ###")
+
+try:
+    # Ouverture de la connexion réseau (TCP)
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.connect((HOST, PORT))
+    print("✅ Connecté au serveur Spark ! Démarrage du flux de données...\n")
+    
+    batch_num = 1
+    while True:
+        for _ in range(5):
+            now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + "Z"
+            event = {"id": str(uuid.uuid4()), "time": now, "dh_poc_gen_timestamp": now}
+            
+            # On envoie le JSON suivi d'un saut de ligne (indispensable pour Spark)
+            message = json.dumps(event) + "\n"
+            s.sendall(message.encode('utf-8'))
+            
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] -> Vague {batch_num} injectée dans la RAM de Spark.")
+        batch_num += 1
+        time.sleep(3) # Attente entre chaque vague
+        
+except ConnectionRefusedError:
+    print("\n❌ ERREUR : Connexion refusée. As-tu bien lancé le script Spark en premier ?")
+    print("Spark doit ouvrir le port AVANT que ce script ne puisse s'y connecter.")
+except KeyboardInterrupt:
+    print("\n### ARRÊT DE LA SIMULATION API ###")
+    s.close()
+```
+
+### 🚀 Comment lancer ce test :
+
+C'est une danse très précise en deux temps :
+
+1. **Ouvre un 1er terminal dans DevX.** Lance `python main_cloudevent.py`. Laisse-le tourner. Il va te dire *"Écoute réseau activée..."*.
+2. **Ouvre un 2ème terminal dans DevX.** Lance `python api_simulator.py`. Il va se connecter au port du 1er terminal et lui injecter les données directement.
+3. Observe les logs du 1er terminal et va sur Starburst pour voir tes données arriver sans jamais avoir touché le COS !
+
+Est-ce que cette approche "Direct Network" répond bien à ta volonté de t'affranchir du système de fichiers ?
+
+
 C'est la question parfaite. Si l'équipe infrastructure n'a pas ouvert Livy (ou si tu n'as pas l'URL), on sort l'arme absolue du développeur Python : le module **`subprocess`**.
 
 Puisque tu m'as prouvé avec tes captures d'écran que tu avais un fichier **`submit_sparktacus.sh`** qui fonctionnait très bien dans ton terminal bash, on va tout simplement utiliser Python pour "cliquer" sur ce script à ta place !
