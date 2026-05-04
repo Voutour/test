@@ -1,3 +1,153 @@
+Voici ton fichier **`main_cloudevent.py`** réécrit de A à Z. 
+
+Il intègre toutes nos optimisations : la lecture en continu (Vrai Streaming), la tolérance aux pannes (Checkpoints) et l'envoi direct par API REST vers Starburst. 
+
+Tu peux copier-coller ce code complet et écraser ton ancien fichier.
+
+```python
+import sys
+import json
+import ssl
+import urllib.request
+import base64
+from datetime import datetime
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import current_timestamp
+from pyspark.sql.types import StructType, StructField, StringType
+
+# ==========================================
+# 1. CONFIGURATIONS
+# ==========================================
+STARBURST_USER = "ton_identifiant" 
+STARBURST_PASS = "ton_mot_de_passe" 
+TRINO_HOST = "starburst-ap26761-dev-05b792a6.data.cloud.net.intra"
+TRINO_PORT = 443
+
+# Chemins S3 (Le "Buffer" entre l'API et Spark)
+S3_RAW_PATH = "s3a://bu002i004226/poc_streaming/input_cloudevent_raw/"
+
+# ⚠️ On crée un nouveau nom de dossier pour le checkpoint pour repartir sur une base 100% propre
+CHECKPOINT_PATH = "s3a://bu002i004226/poc_streaming/checkpoint_streaming_final/"
+
+# ==========================================
+# 2. INITIALISATION SPARK
+# ==========================================
+spark = SparkSession.builder \
+    .appName("PoC-Spark-True-Streaming") \
+    .config("spark.sql.streaming.fileSource.log.deletion", "true") \
+    .getOrCreate()
+    
+spark.sparkContext.setLogLevel("WARN")
+
+# Le schéma attendu dans les fichiers JSON générés par la médiation
+schema_events = StructType([
+    StructField("id", StringType(), True),
+    StructField("time", StringType(), True),
+    StructField("dh_poc_gen_timestamp", StringType(), True)
+])
+
+# ==========================================
+# 3. FONCTION API TRINO (STARBURST)
+# ==========================================
+def execute_trino_query_natively(query, host, port, user, password):
+    """Envoie une requête SQL nativement à Trino/Starburst sans dépendance JDBC."""
+    url = f"https://{host}:{port}/v1/statement"
+    auth_base64 = base64.b64encode(f"{user}:{password}".encode('utf-8')).decode('utf-8')
+    headers = {'X-Trino-User': user, 'Authorization': f'Basic {auth_base64}'}
+    
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    req = urllib.request.Request(url, data=query.encode('utf-8'), headers=headers, method='POST')
+    try:
+        with urllib.request.urlopen(req, context=ctx) as response:
+            res_data = json.loads(response.read().decode('utf-8'))
+            if 'error' in res_data:
+                raise Exception(f"Erreur immédiate: {res_data['error']['message']}")
+                
+            while 'nextUri' in res_data:
+                req_next = urllib.request.Request(res_data['nextUri'], headers=headers, method='GET')
+                with urllib.request.urlopen(req_next, context=ctx) as response_next:
+                    res_data = json.loads(response_next.read().decode('utf-8'))
+                    if 'error' in res_data:
+                        raise Exception(f"Erreur d'exécution: {res_data['error']['message']}")
+            return True
+    except urllib.error.HTTPError as e:
+        raise Exception(f"Erreur HTTP {e.code}: {e.read().decode()}")
+
+# ==========================================
+# 4. LOGIQUE DE TRAITEMENT DES BATCHS
+# ==========================================
+def push_to_starburst(df, batch_id):
+    """Cette fonction est appelée par Spark à chaque fois qu'un nouveau fichier apparaît sur le COS."""
+    rows = df.collect()
+    nb_lignes = len(rows)
+    
+    if nb_lignes > 0:
+        values_list = []
+        for row in rows:
+            if row.id is None: continue 
+            # On formate proprement le timestamp T3 calculé par Spark
+            t3_str = row.dh_poc_spark_read_timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            
+            # Création de la ligne SQL (T1, T2, T3 et demande à Starburst de calculer T4)
+            values_list.append(f"('{row.id}', '{row.time}', '{row.dh_poc_gen_timestamp}', TIMESTAMP '{t3_str}', CAST(CURRENT_TIMESTAMP AS TIMESTAMP(3)))")
+            
+        if values_list:
+            values_string = ",\n".join(values_list)
+            sql_query = f"INSERT INTO dh_poc_ice.pocspark.cloudevent_direct (id, time, dh_poc_gen_timestamp, dh_poc_spark_read_timestamp, dh_poc_starburst_receive_timestamp) VALUES {values_string}"
+            
+            try:
+                execute_trino_query_natively(sql_query, TRINO_HOST, TRINO_PORT, STARBURST_USER, STARBURST_PASS)
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Batch {batch_id} : {nb_lignes} événements envoyés à Starburst.")
+            except Exception as e:
+                print(f"❌ ERREUR API (Batch {batch_id}) : {str(e)}", file=sys.stderr)
+    else:
+        # Batch vide (normal en streaming s'il n'y a pas de nouveaux fichiers)
+        pass
+
+# ==========================================
+# 5. DÉMARRAGE DU VRAI STREAMING
+# ==========================================
+print("### DÉMARRAGE DU MOTEUR SPARK STREAMING ###")
+print(f"-> Écoute continue sur le bucket : {S3_RAW_PATH}")
+
+# 1. Lecture en continu du S3
+df_stream = spark.readStream \
+    .format("json") \
+    .schema(schema_events) \
+    .option("maxFilesPerTrigger", 50) \
+    .load(S3_RAW_PATH)
+
+# 2. Ajout du timestamp T3 (L'heure où Spark lit la donnée)
+df_processed = df_stream.select(
+    "*", 
+    current_timestamp().alias("dh_poc_spark_read_timestamp")
+)
+
+# 3. Envoi au moteur (Micro-batches toutes les 2 secondes)
+query = df_processed.writeStream \
+    .foreachBatch(push_to_starburst) \
+    .option("checkpointLocation", CHECKPOINT_PATH) \
+    .trigger(processingTime='2 seconds') \
+    .start()
+
+# Empêche le script de se terminer
+query.awaitTermination()
+```
+
+### Ton plan d'action pour le grand test :
+
+1. Remplace le code, n'oublie pas de mettre tes identifiants `STARBURST_USER` et `STARBURST_PASS`.
+2. Upload ce `main_cloudevent.py` sur ton S3.
+3. Lance ton orchestrateur (`python trigger_spark_local.py` ou le script sh) pour démarrer le cluster.
+4. Lance l'API de médiation (`python mediation_api.py`) dans ton DevX pour simuler l'arrivée des requêtes.
+5. Va boire un café, puis vérifie ta table Starburst pour admirer les données qui s'empilent !
+
+As-tu également besoin que je te redonne le code de l'API de médiation (avec les clés HMAC) pour que tu aies le package complet, ou as-tu conservé la version précédente ?
+
+
 C'est le choix le plus robuste et le plus proche de la réalité industrielle. Dans cette architecture, le **Cloud Object Storage (COS)** sert de "mémoire tampon" (Buffer). 
 
 Cela résout tous tes problèmes :
