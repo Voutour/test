@@ -1,3 +1,175 @@
+C'est le choix le plus robuste et le plus proche de la réalité industrielle. Dans cette architecture, le **Cloud Object Storage (COS)** sert de "mémoire tampon" (Buffer). 
+
+Cela résout tous tes problèmes :
+1.  **Vrai Spark Streaming :** On utilise enfin la fonction `readStream` native, qui est conçue pour tourner 24h/24.
+2.  **Découplage :** Si ton job Spark redémarre, les appels API de la médiation ne sont pas perdus ; ils attendent sagement sous forme de fichiers sur le COS.
+3.  **Audit :** Tu gardes une trace de chaque événement brut (JSON) avant transformation.
+
+### Schéma du Flux (Architecture Buffer COS)
+
+Voici comment tes deux composants vont interagir sans jamais se bloquer l'un l'autre.
+
+```json?chameleon
+{"component":"LlmGeneratedComponent","props":{"height":"600px","prompt":"Create an interactive data flow diagram for 'API-to-S3-to-Spark' architecture. \n\nNodes:\n1. 'Client/App' (Sends HTTP POST)\n2. 'Médiation API' (Python script, writes to S3)\n3. 'COS S3 (Raw Zone)' (The Buffer/Queue)\n4. 'Spark Streaming' (The Consumer, readStream)\n5. 'Starburst/Iceberg' (Final Destination)\n\nInteraction:\n- When 'Médiation' node is clicked, show a code snippet of a PUT request to S3.\n- When 'Spark' node is clicked, show the 'readStream' logic.\n- Add an animation showing a 'message' moving from 1 to 5. \n- Use professional blueprint-style icons for S3, Spark, and Database.","id":"im_8035afe8841efba7"}}
+```
+
+---
+
+### 1. Le Code de Médiation (`mediation_api.py`)
+Ce code simule ton service de médiation. Il reçoit l'événement et utilise l'authentification S3 native (sans `boto3`) pour l'écrire instantanément sur le COS.
+
+```python
+import urllib.request
+import datetime
+import hashlib
+import hmac
+import json
+import time
+import uuid
+import ssl
+
+# --- CONFIG COS ---
+ACCESS_KEY = "TON_ACCESS_KEY"
+SECRET_KEY = "TON_SECRET_KEY"
+REGION = "eu-fr2"
+ENDPOINT = "https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud"
+BUCKET_NAME = "bu002i004226"
+PREFIX_PATH = "poc_streaming/input_cloudevent_raw/"
+
+def put_s3_object_native(bucket, key, data_string):
+    host = ENDPOINT.replace('https://', '').replace('http://', '')
+    t = datetime.datetime.now(datetime.timezone.utc)
+    amz_date = t.strftime('%Y%m%dT%H%M%SZ')
+    date_stamp = t.strftime('%Y%m%d')
+    payload_hash = hashlib.sha256(data_string.encode('utf-8')).hexdigest()
+    canonical_uri = '/' + bucket + '/' + key
+    canonical_headers = f'host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n'
+    signed_headers = 'host;x-amz-content-sha256;x-amz-date'
+    canonical_request = f'PUT\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}'
+    algorithm = 'AWS4-HMAC-SHA256'
+    credential_scope = f'{date_stamp}/{REGION}/s3/aws4_request'
+    string_to_sign = f'{algorithm}\n{amz_date}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()}'
+    
+    def sign(key, msg): return hmac.new(key, msg.encode('utf-8'), hashlib.sha256).digest()
+    kDate = sign(('AWS4' + SECRET_KEY).encode('utf-8'), date_stamp)
+    kRegion = sign(kDate, REGION)
+    kService = sign(kRegion, 's3')
+    kSigning = sign(kService, 'aws4_request')
+    signature = hmac.new(kSigning, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
+    
+    auth_header = f'{algorithm} Credential={ACCESS_KEY}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}'
+    headers = {'x-amz-date': amz_date, 'x-amz-content-sha256': payload_hash, 'Authorization': auth_header}
+    
+    req = urllib.request.Request(f"{ENDPOINT}{canonical_uri}", data=data_string.encode('utf-8'), headers=headers, method='PUT')
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(req, context=ctx) as response:
+        return response.status
+
+# Simulation d'un appel API entrant
+def on_api_call_received():
+    now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + "Z"
+    event = {"id": str(uuid.uuid4()), "time": now, "dh_poc_gen_timestamp": now}
+    
+    # On écrit un fichier par événement (ou petit batch) pour le streaming
+    file_name = f"{PREFIX_PATH}event_{int(time.time()*1000)}.json"
+    status = put_s3_object_native(BUCKET_NAME, file_name, json.dumps(event))
+    if status == 200:
+        print(f"📥 API Médiation : Événement reçu et persisté sur COS ({file_name})")
+
+if __name__ == "__main__":
+    print("### SERVICE DE MÉDIATION DÉMARRÉ (Simulateur) ###")
+    while True:
+        on_api_call_received()
+        time.sleep(5) # Simule un appel toutes les 5 secondes
+```
+
+---
+
+### 2. Le Job Spark Streaming (`main_cloudevent.py`)
+Ce code est celui que tu envoies via `spark-submit`. Il utilise `readStream` pour surveiller le COS en temps réel.
+
+```python
+import sys
+import json
+import ssl
+import urllib.request
+import base64
+from datetime import datetime
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, current_timestamp
+from pyspark.sql.types import StructType, StructField, StringType
+
+# --- CONFIGS ---
+STARBURST_USER = "ton_identifiant" 
+STARBURST_PASS = "ton_mot_de_passe" 
+TRINO_HOST = "starburst-ap26761-dev-05b792a6.data.cloud.net.intra"
+TRINO_PORT = 443
+
+S3_RAW_PATH = "s3a://bu002i004226/poc_streaming/input_cloudevent_raw/"
+CHECKPOINT_PATH = "s3a://bu002i004226/poc_streaming/checkpoint_streaming_v2/"
+
+# --- INITIALISATION ---
+spark = SparkSession.builder \
+    .appName("PoC-Spark-Real-Streaming") \
+    .config("spark.sql.streaming.fileSource.log.deletion", "true") \
+    .getOrCreate()
+    
+spark.sparkContext.setLogLevel("WARN")
+
+schema_events = StructType([
+    StructField("id", StringType(), True),
+    StructField("time", StringType(), True),
+    StructField("dh_poc_gen_timestamp", StringType(), True)
+])
+
+# --- LOGIQUE D'INSERTION STARBURST ---
+def push_to_starburst(df, batch_id):
+    rows = df.collect()
+    if len(rows) > 0:
+        values_list = []
+        for row in rows:
+            t3_str = row.dh_poc_spark_read_timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            values_list.append(f"('{row.id}', '{row.time}', '{row.dh_poc_gen_timestamp}', TIMESTAMP '{t3_str}', CAST(CURRENT_TIMESTAMP AS TIMESTAMP(3)))")
+        
+        sql = f"INSERT INTO dh_poc_ice.pocspark.cloudevent_direct VALUES {','.join(values_list)}"
+        
+        # Appel API Trino Native (identique à ton code précédent)
+        # ... [Insérer ici ta fonction execute_trino_query_natively] ...
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 🚀 Spark Streaming : Batch {batch_id} traité ({len(rows)} events).")
+
+# --- LE VRAI STREAMING ---
+print("### SPARK STREAMING EN ÉCOUTE SUR LE COS... ###")
+
+df_stream = spark.readStream \
+    .format("json") \
+    .schema(schema_events) \
+    .option("maxFilesPerTrigger", 10) \
+    .load(S3_RAW_PATH)
+
+df_processed = df_stream.select(
+    "*", 
+    current_timestamp().alias("dh_poc_spark_read_timestamp")
+)
+
+query = df_processed.writeStream \
+    .foreachBatch(push_to_starburst) \
+    .option("checkpointLocation", CHECKPOINT_PATH) \
+    .trigger(processingTime='2 seconds') \
+    .start()
+
+query.awaitTermination()
+```
+
+### Pourquoi c'est la solution gagnante ?
+1.  **Résilience :** Si Spark plante, le `checkpointLocation` lui permet de reprendre exactement là où il s'est arrêté sans doubler les données.
+2.  **Scalabilité :** Si la médiation envoie 10 000 appels/seconde, le COS encaisse tout, et Spark traite par "micro-batches" sans saturer la mémoire.
+3.  **Simplicité :** C'est le code le plus facile à maintenir car il utilise les fonctions standards de Spark.
+
+**Note :** N'oublie pas de nettoyer ton dossier `checkpoint_streaming_v2` sur le S3 avant le tout premier lancement pour repartir sur une base propre !
+
+
 C'est un excellent choix. En utilisant le **Cloud Object Storage (COS)** comme zone tampon (Buffer), tu respectes l'architecture cible de la banque tout en activant le **vrai moteur de streaming de Spark**.
 
 Voici comment l'architecture va fonctionner :
