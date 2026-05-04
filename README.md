@@ -1,3 +1,73 @@
+Tu as **absolument raison**. C'est la réaction d'un vrai Tech Lead ! 
+
+Le `port-forward` est ce qu'on appelle un outil de "débogage développeur". C'est un hack pour te permettre, à toi, depuis ton espace DevX, de traverser le pare-feu le temps de développer ton code. 
+
+**Jamais, au grand jamais, on n'utilise ça en production.**
+
+Dans la vraie vie (en production), ton script de "Médiation" ne tournera pas sur ton DevX. Il tournera sur un vrai serveur de la banque ou sur un autre Pod Kubernetes. Et pour que ces deux machines se parlent proprement, de manière permanente et sans tunnel manuel, on utilise l'architecture réseau native de Kubernetes.
+
+Voici comment ça se passe dans le monde réel, et comment tu peux le reproduire proprement pour ton PoC.
+
+---
+
+### La vraie architecture K8s (Le monde de la Production)
+
+Dans Kubernetes, les Pods (ton script Spark) sont mortels. Leur adresse IP change à chaque redémarrage. Pour régler ça, on crée un objet appelé un **Service Kubernetes**. 
+Le Service agit comme un "standardiste téléphonique" permanent : il a une URL fixe, et il redirige le trafic vers ton Pod Spark, même si l'IP du Pod change.
+
+Pour que ton API soit "propre" et joignable en permanence, il faut créer ce Service.
+
+### Étape 1 : Créer le Service Officiel (La ligne fixe)
+
+Dans ton terminal DevX, tape cette commande pour dire à Kubernetes de créer une ligne officielle et permanente pour ton API Spark :
+
+```bash
+kubectl expose pod NOM_DE_TON_POD_DRIVER --port=8080 --target-port=8080 --name=spark-mediation-api -n spark-a102567-dev-ef25bd0b
+```
+*(Remplace `NOM_DE_TON_POD_DRIVER` par le nom exact de ton pod)*
+
+**Ce qui vient de se passer :**
+Kubernetes vient de créer un DNS interne officiel pour ton API. Son URL permanente à l'intérieur de l'infrastructure de la banque est désormais :
+`http://spark-mediation-api:8080/event`
+
+---
+
+### Étape 2 : Le vrai test de Production (D'application à application)
+
+Puisque ton DevX est un environnement de développement "isolé" à l'extérieur du réseau pur de K8s, il n'a normalement pas le droit d'appeler ce Service directement. C'est normal, c'est la sécurité de la banque.
+
+Dans la vraie vie, l'application "Médiation" est *aussi* déployée sur l'infrastructure. 
+
+Pour simuler cela de manière 100% réaliste, **nous allons lancer ton simulateur (`api_simulator.py`) directement à l'intérieur de Kubernetes**, dans un petit Pod temporaire. Ainsi, les deux applications se parleront via le réseau interne ultra-rapide de la banque, sans aucun port-forward !
+
+1. Ouvre ton terminal DevX.
+2. Lance cette commande magique. Elle crée un micro-conteneur Linux "jetable" à l'intérieur du réseau Kubernetes et ouvre un terminal dedans :
+   ```bash
+   kubectl run -i --tty --rm test-mediation --image=python:3.9-slim -n spark-a102567-dev-ef25bd0b -- bash
+   ```
+3. Tu es maintenant "à l'intérieur" du réseau de production ! Installe l'outil de base pour faire des appels API (curl) :
+   ```bash
+   apt-get update && apt-get install -y curl
+   ```
+4. Fais l'appel API vers l'URL officielle du Service que nous avons créé :
+   ```bash
+   curl -X POST http://spark-mediation-api:8080/event \
+   -H "Content-Type: application/json" \
+   -d '{"id": "TEST-PROD-123", "time": "2026-05-04T12:00:00.000Z", "dh_poc_gen_timestamp": "2026-05-04T12:00:00.000Z"}'
+   ```
+
+### Que va-t-il se passer ?
+
+1. La commande `curl` (qui simule la Médiation) va envoyer le JSON.
+2. Le **Service** `spark-mediation-api` va l'attraper de manière ultra-fiable.
+3. Il va le livrer à ton Pod **Spark**.
+4. Spark va l'insérer dans **Starburst**.
+5. Ton terminal t'affichera la réponse de succès de ton API !
+
+C'est **exactement** comme ça que les microservices communiquent en production. Une fois que ce test avec `curl` fonctionne dans Kubernetes, tu pourras dire à tes architectes : 
+
+> *"Mon job Spark tourne en continu, il est exposé derrière un Service Kubernetes standard (`spark-mediation-api`), et l'équipe Médiation n'a plus qu'à faire ses requêtes POST sur cette URL interne pour ingérer la donnée en temps réel."*
+
 Je comprends parfaitement ton objectif. On efface l'idée du fichier sur le S3 et l'idée du port TCP brut. 
 
 Tu veux reproduire une architecture de **Microservice** : le script Spark est déployé sur Kubernetes, il tourne en permanence (en attente), et il expose une véritable **API REST (HTTP)** pour que l'API de Médiation puisse lui envoyer des événements (via un `POST`). Et tout ça, avec les outils natifs, sans rajouter d'usine à gaz comme Flask ou Kafka.
