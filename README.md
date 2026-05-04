@@ -150,6 +150,158 @@ query.awaitTermination()
 * **Conformité :** Tu respectes le schéma de ta banque tout en ayant un comportement d'API temps-réel.
 
 
+C'est un excellent choix. L'**Option 2 (Architecture Hybride API -> COS -> Spark Streaming)** est la plus robuste et la plus proche de la réalité industrielle d'une banque.
+
+Dans ce scénario :
+1.  **L'API de Médiation** (ton script) fait un appel API vers le Cloud Object Storage (COS) pour déposer un événement.
+2.  **Le moteur Spark** utilise sa fonction native **`readStream`** pour surveiller ce bucket en temps réel. C'est du "Vrai Streaming" : Spark gère lui-même les fichiers lus et non-lus via un **Checkpoint**.
+3.  **Starburst** reçoit les données via l'insertion SQL de Spark.
+
+Voici le guide complet et les scripts mis à jour pour cette architecture.
+
+### L'Architecture du Flux (API-to-Iceberg)
+
+[Image d'une architecture de données montrant une API de médiation envoyant des fichiers JSON vers un bucket S3, puis un cluster Spark Streaming lisant ces fichiers en temps réel pour les insérer dans une table Starburst Iceberg avec un système de checkpointing.]
+
+```json?chameleon
+{"component":"LlmGeneratedComponent","props":{"height":"650px","prompt":"Crée un simulateur interactif d'un pipeline Spark Structured Streaming. \n\nLogic:\n1. Visualise 3 zones : Source (API/S3), Processing (Spark), Sink (Starburst/Iceberg).\n2. Un bouton 'Générer Appel API' ajoute un cube (événement) dans la zone Source.\n3. Une horloge 'Spark Trigger' (ajustable de 1s à 10s) déclenche le passage des cubes vers l'usine Spark.\n4. Spark transforme les cubes (ils changent de couleur) et les envoie vers Starburst.\n5. Affiche un compteur 'Events in Iceberg' et un graphique de latence (temps entre l'appel API et l'écriture finale).\n6. L'utilisateur peut augmenter le 'Throughput' pour voir comment Spark gère les micro-batches (plusieurs cubes traités d'un coup).","id":"im_2e16a186ee298ff1"}}
+```
+
+---
+
+### 1. Le Générateur "Médiation API" (`mediation_api.py`)
+Ce script simule ton service de médiation. Il utilise l'API standard S3 (via les clés HMAC) pour envoyer des événements. C'est un appel API REST direct.
+
+```python
+import urllib.request
+import datetime
+import hashlib
+import hmac
+import json
+import time
+import uuid
+import ssl
+
+# CONFIGURATION COS (API S3)
+ACCESS_KEY = "TON_ACCESS_KEY"
+SECRET_KEY = "TON_SECRET_KEY"
+REGION = "eu-fr2"
+ENDPOINT = "https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud"
+BUCKET_NAME = "bu002i004226"
+PREFIX_PATH = "poc_streaming/input_cloudevent_raw/"
+
+def send_event_via_api(event_data):
+    """Effectue un appel API PUT vers le stockage cloud."""
+    t = datetime.datetime.now(datetime.timezone.utc)
+    amz_date = t.strftime('%Y%m%dT%H%M%SZ')
+    date_stamp = t.strftime('%Y%m%d')
+    file_name = f"{PREFIX_PATH}event_{int(time.time())}_{uuid.uuid4().hex[:6]}.json"
+    
+    payload = json.dumps(event_data)
+    payload_hash = hashlib.sha256(payload.encode('utf-8')).hexdigest()
+    
+    # Signature AWS V4 (Simplifiée pour l'exemple)
+    canonical_uri = f"/{BUCKET_NAME}/{file_name}"
+    # ... (Le code de signature reste identique à celui fourni précédemment) ...
+    # Appel HTTP PUT natif
+    # (Utilise la fonction put_s3_object_native que nous avons validée ensemble)
+    return put_s3_object_native(BUCKET_NAME, file_name, payload, ACCESS_KEY, SECRET_KEY, REGION, ENDPOINT)
+
+print("### SIMULATEUR MÉDIATION API DÉMARRÉ ###")
+try:
+    while True:
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()[:-3] + "Z"
+        event = {"id": str(uuid.uuid4()), "time": now, "dh_poc_gen_timestamp": now}
+        
+        status = send_event_via_api(event)
+        if status == 200:
+            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 🚀 Événement envoyé via API")
+        
+        time.sleep(2) # Envoi toutes les 2 secondes
+except KeyboardInterrupt:
+    print("Arrêt.")
+```
+
+---
+
+### 2. Le Job Spark "Vrai Streaming" (`spark_streaming.py`)
+C'est le code qui tournera en permanence sur Kubernetes. Il utilise **`readStream`** pour ne jamais s'arrêter de surveiller le COS.
+
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, current_timestamp
+from pyspark.sql.types import StructType, StructField, StringType
+import json, ssl, urllib.request, base64
+
+# CONFIG STARBURST
+TRINO_HOST = "starburst-ap26761-dev-05b792a6.data.cloud.net.intra"
+TRINO_USER, TRINO_PASS = "ton_user", "ton_pass"
+
+# CONFIG S3
+S3_RAW_PATH = "s3a://bu002i004226/poc_streaming/input_cloudevent_raw/"
+CHECKPOINT_PATH = "s3a://bu002i004226/poc_streaming/checkpoint_v2/"
+
+spark = SparkSession.builder.appName("Vrai-Spark-Streaming").getOrCreate()
+
+schema = StructType([
+    StructField("id", StringType(), True),
+    StructField("time", StringType(), True),
+    StructField("dh_poc_gen_timestamp", StringType(), True)
+])
+
+# 1. LECTURE EN STREAMING CONTINU
+df_stream = spark.readStream \
+    .format("json") \
+    .schema(schema) \
+    .option("maxFilesPerTrigger", 10) \
+    .load(S3_RAW_PATH)
+
+def push_to_starburst(df, batch_id):
+    """Fonction appelée par Spark à chaque micro-batch."""
+    rows = df.withColumn("t3", current_timestamp()).collect()
+    if not rows: return
+    
+    values = []
+    for r in rows:
+        t3 = r.t3.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        values.append(f"('{r.id}', '{r.time}', '{r.dh_poc_gen_timestamp}', TIMESTAMP '{t3}', CURRENT_TIMESTAMP)")
+    
+    sql = f"INSERT INTO dh_poc_ice.pocspark.cloudevent_direct VALUES {','.join(values)}"
+    # Appel API Trino (Utilise la fonction execute_trino_query_natively)
+    execute_trino_query_natively(sql, TRINO_HOST, 443, TRINO_USER, TRINO_PASS)
+    print(f"Batch {batch_id} traité : {len(rows)} événements.")
+
+# 2. DÉMARRAGE DU MOTEUR DE STREAMING
+query = df_stream.writeStream \
+    .foreachBatch(push_to_starburst) \
+    .option("checkpointLocation", CHECKPOINT_PATH) \
+    .trigger(processingTime='5 seconds') \
+    .start()
+
+query.awaitTermination()
+```
+
+---
+
+### 3. Comment mettre en place (Procédure Pas-à-Pas)
+
+1.  **Nettoyage de l'état :** Avant de commencer, va sur ton bucket COS et **supprime le dossier `checkpoint`** s'il existe déjà. Spark doit repartir de zéro.
+2.  **Déploiement du Job :** Lance ton script `submit_sparktacus.sh` (qui pointe vers `spark_streaming.py`).
+    * Vérifie avec `kubectl logs -f [NOM_DU_POD_DRIVER]` que Spark affiche : *"Waiting for data"*.
+3.  **Lancement de la Médiation :** Dans ton terminal DevX, lance `python mediation_api.py`. 
+    * Chaque ligne affichée par ce script correspond à un appel API réussi vers le bucket.
+4.  **Observation du Streaming :**
+    * Toutes les 5 secondes (selon le `trigger`), Spark va détecter les nouveaux fichiers déposés par l'API.
+    * Il va les lire, calculer le T3, et les injecter dans Starburst.
+5.  **Vérification Finale :** * Va sur Starburst (DBeaver) et fais : `SELECT * FROM cloudevent_direct ORDER BY dh_poc_spark_read_timestamp DESC`.
+    * Tu verras tes événements arriver au fur et à mesure.
+
+### Pourquoi ça marche mieux ainsi ?
+* **Résilience :** Si le job Spark crash, il redémarrera exactement là où il s'est arrêté grâce au `checkpoint`. Aucun événement ne sera perdu.
+* **Scalabilité :** Si la médiation envoie 1000 appels API par seconde, Spark regroupera ces 1000 événements dans un seul micro-batch pour Starburst, ce qui est beaucoup plus efficace.
+* **Conformité :** Tu respectes le schéma de ta banque tout en ayant un comportement d'API temps-réel.
+
+
 
 Tu as **absolument raison**. C'est la réaction d'un vrai Tech Lead ! 
 
