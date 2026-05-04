@@ -1,3 +1,192 @@
+Je comprends parfaitement ton objectif. On efface l'idée du fichier sur le S3 et l'idée du port TCP brut. 
+
+Tu veux reproduire une architecture de **Microservice** : le script Spark est déployé sur Kubernetes, il tourne en permanence (en attente), et il expose une véritable **API REST (HTTP)** pour que l'API de Médiation puisse lui envoyer des événements (via un `POST`). Et tout ça, avec les outils natifs, sans rajouter d'usine à gaz comme Flask ou Kafka.
+
+Voici la vérité technique : **Spark n'est pas un serveur Web.** Il n'a pas de fonction `readStream.format("http_api")`. 
+Mais comme on travaille en Python, on peut utiliser la librairie native `http.server` intégrée à Python pour **transformer ton job Spark en une véritable API REST**.
+
+Voici la solution exacte pour ton PoC, divisée en deux scripts.
+
+---
+
+### 1. Le Job Spark (Le Serveur API qui tourne en permanence sur K8s)
+
+Ce script sera soumis via ton `submit_sparktacus.sh`. Une fois lancé, il ne s'arrêtera pas. Il va ouvrir un endpoint HTTP (`POST /event`) directement sur le pod Kubernetes, prêt à recevoir les appels de la médiation.
+
+```python
+import sys
+import json
+import ssl
+import urllib.request
+import base64
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pyspark.sql import SparkSession
+from pyspark.sql.types import StructType, StructField, StringType
+
+# ==========================================
+# 1. CONFIGURATIONS
+# ==========================================
+STARBURST_USER = "ton_identifiant" 
+STARBURST_PASS = "ton_mot_de_passe" 
+TRINO_HOST = "starburst-ap26761-dev-05b792a6.data.cloud.net.intra"
+TRINO_PORT = 443
+
+API_PORT = 8080  # Le port sur lequel l'API Spark va écouter
+
+# ==========================================
+# 2. INITIALISATION SPARK
+# ==========================================
+spark = SparkSession.builder \
+    .appName("PoC-Spark-API-Listener") \
+    .getOrCreate()
+spark.sparkContext.setLogLevel("WARN")
+
+schema_events = StructType([
+    StructField("id", StringType(), True),
+    StructField("time", StringType(), True),
+    StructField("dh_poc_gen_timestamp", StringType(), True)
+])
+
+# ==========================================
+# 3. FONCTION TRINO (Inchangée)
+# ==========================================
+def execute_trino_query_natively(query, host, port, user, password):
+    url = f"https://{host}:{port}/v1/statement"
+    auth_base64 = base64.b64encode(f"{user}:{password}".encode('utf-8')).decode('utf-8')
+    headers = {'X-Trino-User': user, 'Authorization': f'Basic {auth_base64}'}
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    req = urllib.request.Request(url, data=query.encode('utf-8'), headers=headers, method='POST')
+    try:
+        with urllib.request.urlopen(req, context=ctx) as response:
+            res_data = json.loads(response.read().decode('utf-8'))
+            while 'nextUri' in res_data:
+                req_next = urllib.request.Request(res_data['nextUri'], headers=headers, method='GET')
+                with urllib.request.urlopen(req_next, context=ctx) as response_next:
+                    res_data = json.loads(response_next.read().decode('utf-8'))
+            return True
+    except urllib.error.HTTPError as e:
+        raise Exception(f"Erreur HTTP {e.code}: {e.read().decode()}")
+
+# ==========================================
+# 4. LE SERVEUR API NATIF (Sans Flask)
+# ==========================================
+class SparkAPIHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        """Cette fonction est déclenchée automatiquement à chaque appel API de la médiation."""
+        if self.path == '/event':
+            # 1. Lecture de la donnée envoyée par l'API de médiation
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            event_json = json.loads(post_data.decode('utf-8'))
+            
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] 📥 Appel API reçu ! Traitement dans Spark...")
+
+            # 2. Injection dans Spark
+            # Spark lit le JSON instantanément (calcul du T3)
+            df = spark.createDataFrame([event_json], schema=schema_events)
+            row = df.collect()[0]
+            
+            t3_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            
+            # 3. Préparation et envoi à Starburst (calcul du T4)
+            sql_query = f"""
+                INSERT INTO dh_poc_ice.pocspark.cloudevent_direct 
+                (id, time, dh_poc_gen_timestamp, dh_poc_spark_read_timestamp, dh_poc_starburst_receive_timestamp) 
+                VALUES ('{row.id}', '{row.time}', '{row.dh_poc_gen_timestamp}', TIMESTAMP '{t3_str}', CAST(CURRENT_TIMESTAMP AS TIMESTAMP(3)))
+            """
+            
+            try:
+                execute_trino_query_natively(sql_query, TRINO_HOST, TRINO_PORT, STARBURST_USER, STARBURST_PASS)
+                
+                # 4. Réponse de succès à la médiation
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "success", "message": "Événement ingéré dans Starburst"}).encode())
+                print(f"✅ Événement {row.id} inséré avec succès !\n")
+                
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode())
+                print(f"❌ Erreur lors de l'insertion : {str(e)}\n")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+# Démarrage du serveur infini
+server_address = ('0.0.0.0', API_PORT)
+httpd = HTTPServer(server_address, SparkAPIHandler)
+print(f"### SERVEUR SPARK DÉMARRÉ ###")
+print(f"-> L'API est en écoute permanente sur le port {API_PORT}...")
+httpd.serve_forever()
+```
+
+---
+
+### 2. Le Simulateur de Médiation (L'Appelant)
+
+C'est ce script que tu feras tourner sur DevX pour simuler les envois de la vraie API.
+**Attention :** Tu devras remplacer l'IP `127.0.0.1` par l'adresse IP interne de ton pod Kubernetes (ou le nom de son Service K8s) pour que DevX puisse le joindre.
+
+```python
+import urllib.request
+import json
+import time
+import uuid
+from datetime import datetime, timezone
+
+# L'adresse de ton Job Spark qui tourne sur Kubernetes
+# Si tu l'as lancé sur K8s, il faut l'IP du Pod. 
+# Si tu testes d'abord tout en local sur DevX, laisse 127.0.0.1
+SPARK_API_URL = "http://127.0.0.1:8080/event"
+
+print(f"### SIMULATEUR DE MÉDIATION ###")
+print(f"-> Envoi des appels API vers {SPARK_API_URL}\n")
+
+batch_num = 1
+try:
+    while True:
+        # Création de l'événement
+        now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + "Z"
+        event = {
+            "id": str(uuid.uuid4()),
+            "time": now,
+            "dh_poc_gen_timestamp": now
+        }
+        
+        # Envoi de la requête POST (Appel API)
+        req = urllib.request.Request(
+            SPARK_API_URL, 
+            data=json.dumps(event).encode('utf-8'), 
+            headers={'Content-Type': 'application/json'}, 
+            method='POST'
+        )
+        
+        try:
+            with urllib.request.urlopen(req) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] 🚀 Appel {batch_num} envoyé | Réponse de Spark : {result['status']}")
+        except Exception as e:
+            print(f"[!] Erreur de l'appel API : {str(e)}")
+            
+        batch_num += 1
+        time.sleep(3) # On simule un appel toutes les 3 secondes
+
+except KeyboardInterrupt:
+    print("\n### ARRÊT DU SIMULATEUR ###")
+```
+
+### 🚨 Le point bloquant potentiel (Réseau Kubernetes)
+Puisque ton job Spark est soumis sur le cluster Kubernetes de la banque, il est enfermé dans un conteneur. Quand tu vas démarrer le script `submit_sparktacus.sh`, le serveur web va s'allumer sur le Pod. 
+* Si l'équipe infra a fermé tous les ports entrants du pod, ton script de DevX recevra une erreur `Connection Refused` ou `Timeout`.
+* Si cela arrive, c'est justement la raison pour laquelle les architectes ont mis un "Cloud Object Storage" ou un "Kafka" au milieu sur ton schéma initial : pour éviter que deux réseaux sécurisés aient à se parler en direct via API.
+
+
 C'est normal que ça ait planté, et je m'y attendais un peu. C'est le mur classique de la sécurité bancaire et de Kubernetes ! 
 
 Le "hack" du port réseau (le port 9999) que je t'ai proposé s'est heurté à deux réalités techniques incontournables de ton infrastructure :
