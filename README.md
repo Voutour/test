@@ -1,3 +1,155 @@
+C'est la question fondamentale pour bien comprendre ton architecture et, surtout, pour la défendre brillamment devant tes collègues ou tes architectes. 
+
+Voici l'explication conceptuelle de ce que nous venons de construire, de manière simple et concrète.
+
+### 1. Le fonctionnement du duo (Producteur / Consommateur)
+
+Ton architecture est divisée en deux rôles stricts qui ne se parlent jamais directement. Le Cloud Object Storage (COS / S3) fait office de "boîte aux lettres" au milieu.
+
+* **Script 1 : La Médiation (Le Producteur) :**
+  C'est ton guichetier. Il reçoit les requêtes de l'extérieur (les événements). Son seul et unique travail est d'écrire ces événements le plus vite possible dans des petits fichiers texte (JSON-Lines) et de les jeter dans le bucket S3. Dès que le fichier est déposé, son travail est terminé.
+* **Script 2 : Spark (Le Consommateur) :**
+  C'est ton ouvrier spécialisé. Il est sourd et aveugle à ce qui se passe sur l'API. Son seul travail est de fixer le bucket S3 en permanence. Dès qu'il voit un nouveau fichier apparaître, il le prend, le lit, ajoute le timestamp, et l'expédie à Starburst.
+
+### 2. En quoi c'est du "Streaming" ?
+
+En data, on oppose souvent le **Batch** (le traitement par lots) au **Streaming** (le flux continu).
+
+Si tu avais fait un script Spark classique (avec `spark.read`), ton script se serait allumé à minuit, aurait lu les fichiers de la journée, les aurait envoyés, puis se serait éteint. C'est du **Batch**.
+
+Ici, c'est du **Streaming (Micro-Batching)** grâce à la fonction `spark.readStream` :
+* Le job ne s'éteint jamais (il tourne 24h/24).
+* Il n'attend pas la fin de la journée : le paramètre `trigger(processingTime='2 seconds')` lui dit de vérifier le COS toutes les 2 secondes. 
+* La donnée traverse toute l'architecture en quelques secondes à peine. Ce n'est pas du "Temps Réel Pur" (qui se mesure en millisecondes), mais c'est du **Temps Réel Asynchrone**, ce qui est le standard pour 90% des architectures Big Data modernes.
+
+### 3. En quoi cette approche remplace Kafka ?
+
+Kafka est un "Message Broker" (un courtier de messages). Son but est de découpler les systèmes pour éviter qu'ils ne se fassent planter les uns les autres. **Ici, nous utilisons le S3 exactement comme un Kafka.**
+
+* **Le Buffer (L'amortisseur) :** Si la Médiation reçoit 100 000 événements d'un coup (un pic d'activité), un serveur web classique planterait. Ici, la Médiation va juste déposer de très gros fichiers sur le S3. Le S3 a une capacité de stockage infinie, il ne plantera jamais. Spark viendra dépiler ces fichiers tranquillement, à son propre rythme. 
+* **Le Découplage :** Si ton cluster Kubernetes Spark plante ou redémarre pendant 10 minutes, ce n'est pas grave ! L'API de médiation continue d'écrire ses fichiers sur le S3.
+* **La Tolérance aux Pannes (L'équivalent des Offsets Kafka) :** Kafka utilise des "Offsets" pour se souvenir du dernier message lu. Spark utilise les dossiers de **Checkpoints** sur le S3. Quand Spark redémarre après un crash, il regarde son fichier de checkpoint, voit qu'il s'est arrêté au fichier `burst_1234.json`, et reprend la lecture exactement à cet endroit sans perdre ni dupliquer aucune donnée.
+
+**En résumé :** Tu as recréé la robustesse et la philosophie d'un cluster Kafka ultra-complexe, mais en utilisant uniquement un simple bucket de stockage (S3) et les fonctions natives de Spark. C'est élégant, peu coûteux et "Production-Ready".
+
+Pour simuler une charge beaucoup plus importante (ce qu'on appelle un "Load Test" ou test en rafale), nous devons modifier uniquement le script de la **Médiation API** (`mediation_api.py`).
+
+Au lieu d'envoyer un fichier S3 pour chaque événement (ce qui est très lent et sature les requêtes HTTP), nous allons simuler un comportement de "Micro-Batching" au niveau de l'API. Le script va générer 50 événements d'un coup, les regrouper dans un seul fichier texte (au format **JSON-Lines**, le format préféré de Spark), et l'envoyer sur le COS. 
+
+Spark va lire ce fichier, comprendre qu'il contient 50 lignes, et envoyer un seul gros `SQL INSERT` massif vers Starburst. C'est exactement comme ça qu'on optimise les performances en Big Data !
+
+Voici le code **`mediation_api.py`** mis à jour pour le mode "Rafale" :
+
+```python
+import urllib.request
+import datetime
+import hashlib
+import hmac
+import json
+import time
+import uuid
+import ssl
+
+# ==========================================
+# 1. CONFIGURATIONS COS
+# ==========================================
+ACCESS_KEY = "TON_ACCESS_KEY"
+SECRET_KEY = "TON_SECRET_KEY"
+REGION = "eu-fr2"
+ENDPOINT = "https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud"
+BUCKET_NAME = "bu002i004226"
+PREFIX_PATH = "poc_streaming/input_cloudevent_raw/"
+
+# ==========================================
+# 2. ENVOI NATIF S3
+# ==========================================
+def put_s3_object_native(bucket, key, data_string):
+    host = ENDPOINT.replace('https://', '').replace('http://', '')
+    t = datetime.datetime.now(datetime.timezone.utc)
+    amz_date = t.strftime('%Y%m%dT%H%M%SZ')
+    date_stamp = t.strftime('%Y%m%d')
+    payload_hash = hashlib.sha256(data_string.encode('utf-8')).hexdigest()
+    canonical_uri = '/' + bucket + '/' + key
+    canonical_headers = f'host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n'
+    signed_headers = 'host;x-amz-content-sha256;x-amz-date'
+    canonical_request = f'PUT\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}'
+    algorithm = 'AWS4-HMAC-SHA256'
+    credential_scope = f'{date_stamp}/{REGION}/s3/aws4_request'
+    string_to_sign = f'{algorithm}\n{amz_date}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()}'
+    
+    def sign(key, msg): return hmac.new(key, msg.encode('utf-8'), hashlib.sha256).digest()
+    kDate = sign(('AWS4' + SECRET_KEY).encode('utf-8'), date_stamp)
+    kRegion = sign(kDate, REGION)
+    kService = sign(kRegion, 's3')
+    kSigning = sign(kService, 'aws4_request')
+    signature = hmac.new(kSigning, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
+    
+    auth_header = f'{algorithm} Credential={ACCESS_KEY}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}'
+    headers = {'x-amz-date': amz_date, 'x-amz-content-sha256': payload_hash, 'Authorization': auth_header}
+    
+    req = urllib.request.Request(f"{ENDPOINT}{canonical_uri}", data=data_string.encode('utf-8'), headers=headers, method='PUT')
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(req, context=ctx) as response:
+        return response.status
+
+# ==========================================
+# 3. SIMULATEUR DE CHARGE (LOAD TEST)
+# ==========================================
+def generate_event_burst(nb_events_per_burst):
+    """Génère plusieurs événements simultanément et les envoie dans un seul fichier JSON-Lines."""
+    lines = []
+    
+    for _ in range(nb_events_per_burst):
+        now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + "Z"
+        event = {
+            "id": str(uuid.uuid4()), 
+            "time": now, 
+            "dh_poc_gen_timestamp": now
+        }
+        # On convertit le dict en texte JSON et on l'ajoute à la liste
+        lines.append(json.dumps(event))
+        
+    # Le format JSON-Lines requiert un saut de ligne entre chaque objet JSON
+    payload = "\n".join(lines)
+    
+    file_name = f"{PREFIX_PATH}burst_{int(time.time()*1000)}.json"
+    
+    try:
+        status = put_s3_object_native(BUCKET_NAME, file_name, payload)
+        if status == 200:
+            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 🚀 Rafale de {nb_events_per_burst} événements déposée sur le COS.")
+    except Exception as e:
+        print(f"❌ Erreur lors de l'envoi : {str(e)}")
+
+if __name__ == "__main__":
+    print("### SERVICE DE MÉDIATION (MODE HAUTE FRÉQUENCE) ###")
+    print("Appuyez sur Ctrl+C pour arrêter le bombardement...\n")
+    
+    # Paramètres du test de charge
+    EVENTS_PER_BURST = 50   # Nombre d'événements créés en même temps
+    WAIT_TIME_SECONDS = 2   # Temps de pause entre chaque rafale
+    
+    try:
+        while True:
+            generate_event_burst(EVENTS_PER_BURST)
+            time.sleep(WAIT_TIME_SECONDS)
+            
+    except KeyboardInterrupt:
+        print("\n### ARRÊT DU SIMULATEUR ###")
+```
+
+### Ce que tu vas observer avec ce script :
+
+1. Ton simulateur Python va envoyer 50 requêtes d'un coup, faire une pause de 2 secondes, puis recommencer. (Soit 25 requêtes par seconde en moyenne).
+2. Ton script Spark (qui écoute le COS en tâche de fond) va repérer ce fichier, le lire, et afficher dans ses logs : `Batch X : 50 événements envoyés à Starburst`.
+3. Ta table Starburst va se remplir à une vitesse grand V.
+
+N'oublie pas de bien remettre tes vraies clés (`ACCESS_KEY` et `SECRET_KEY`) avant de lancer le script. Bon bombardement !
+
+
+
 Voici ton fichier **`main_cloudevent.py`** réécrit de A à Z. 
 
 Il intègre toutes nos optimisations : la lecture en continu (Vrai Streaming), la tolérance aux pannes (Checkpoints) et l'envoi direct par API REST vers Starburst. 
