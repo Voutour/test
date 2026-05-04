@@ -1,85 +1,94 @@
-En gros Pour l’api :
-Le service de médiation va appeler un service qui tourne en permanence. Au lieu d’écouter un fichier dans le cos, il écoute des appels par api.
-Il faut que le truc tourne en permanence.
-Dans devx, un service qui va simuler les appels d’API et un service qui va monter un contener spark qui va écouter. 
-API post generic event qui fait un appel pour simuler
+C'est une excellente vision architecturale ! Tu décris exactement le pattern **"Event-Driven API Gateway"** (Passerelle d'API orientée événements). C'est le standard ultime pour le temps réel.
 
-Le principe : Appel le code par api pendant qu’il est déjà submité en amont
+Cependant, il faut que je sois très transparent avec toi sur une réalité fondamentale du Big Data : **Spark n'est pas un serveur Web.** Tu ne peux pas faire une requête HTTP `POST` directement à un job Spark. Il n'a pas été conçu pour héberger des routes d'API (comme `/api/events`). Il est fait pour "avaler" des flux de données en continu. Dans la vraie vie, l'API de médiation reçoit le `POST` et pousse l'événement dans un **Message Broker** (comme Kafka), et Spark écoute ce Kafka.
 
+Puisque nous n'avons pas de Kafka pour ce PoC et que tu ne veux plus passer par les fichiers du COS, nous allons créer un **Médiateur hybride (API + Socket)** dans ton DevX. 
 
-Je comprends parfaitement ta vision. C'est l'architecture cible par excellence pour du vrai temps réel (Event-Driven Architecture) : le service de médiation veut juste faire un `POST /api/events` sur une URL, et s'en laver les mains.
-
-Cependant, il faut que je sois très transparent sur un point technique fondamental : **Spark n'est pas un serveur Web.** Spark est un moteur de calcul de Big Data. Il ne possède pas la capacité native d'exposer une URL du type `http://mon-serveur/api` pour écouter des requêtes HTTP `POST`. Dans la vraie vie, on place toujours un outil comme **Kafka** entre l'API et Spark. L'API reçoit le HTTP, le met dans Kafka, et Spark écoute Kafka.
-
-Mais comme nous sommes dans un PoC sur DevX et qu'on ne va pas installer Kafka, j'ai la solution parfaite pour simuler ça avec **zéro dépendance (100% Python natif)**.
-
-Nous allons créer une architecture en **3 briques** :
-
-1. **Le Serveur Spark (Le Cerveau) :** Il tourne en permanence et écoute un flux de données brut sur un port réseau interne (le code que je t'ai donné dans mon message précédent).
-2. **Le Serveur API (La Passerelle) :** C'est un mini-serveur Web en Python qui tourne en permanence. Il expose ton endpoint `POST`. Quand il reçoit la requête de la médiation, il la "traduit" et l'injecte dans le port interne de Spark.
-3. **Le Simulateur (La Médiation) :** Un petit script qui fait des appels HTTP `POST` génériques.
-
-Voici les deux nouveaux scripts pour compléter ton architecture.
+Voici l'architecture que nous allons mettre en place :
+1.  **Le Job Spark (K8s ou DevX) :** Il tourne en permanence (`spark-submit` en amont) et écoute un port réseau TCP (le fameux mode Socket de mon message précédent).
+2.  **L'API de Médiation (DevX) :** C'est un petit serveur Web Python. Il expose un vrai endpoint REST (`POST /api/event`). Quand il reçoit un événement de ton simulateur, il le transfère instantanément au port TCP de Spark.
+3.  **Le Simulateur (DevX) :** Il fait des requêtes `POST` classiques à ton API.
 
 ---
 
-### 1. Le Serveur API (`api_gateway.py`)
-Ce script tourne en permanence dans DevX. C'est lui qui va recevoir les vrais appels REST (HTTP POST) et les pousser dans la mémoire de Spark. Il utilise la librairie `http.server` intégrée à Python, donc aucun `pip install` n'est nécessaire.
+### 1. Le Serveur API de Médiation (Le "Passeur")
+
+Ce script est le chaînon manquant. Il fait deux choses en même temps (grâce au multithreading) : il héberge une API Web classique sur le port `5000` et il ouvre le port `9999` pour que Spark s'y branche.
+
+Crée un fichier **`api_gateway.py`** dans DevX :
 
 ```python
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
 import socket
 import json
+import time
+from flask import Flask, request, jsonify
 
-# Configuration
-API_PORT = 8080           # Le port exposé à l'équipe de Médiation
-SPARK_HOST = '127.0.0.1'  # L'adresse interne où tourne Spark
-SPARK_PORT = 9999         # Le port d'écoute natif de Spark
+app = Flask(__name__)
+event_buffer = [] # Notre "file d'attente" en mémoire
 
-class WebhookAPI(BaseHTTPRequestHandler):
-    def do_POST(self):
-        try:
-            # 1. On lit le payload JSON reçu via l'appel API
-            content_length = int(self.headers.get('Content-Length', 0))
-            post_data = self.rfile.read(content_length)
-            
-            # 2. On ouvre un tuyau réseau direct vers Spark pour lui injecter la donnée
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.connect((SPARK_HOST, SPARK_PORT))
-                # Spark exige un saut de ligne (\n) pour comprendre que l'événement est fini
-                s.sendall(post_data + b'\n')
+# ==========================================
+# 1. LA ROUTE API (Ce que le simulateur appelle)
+# ==========================================
+@app.route('/api/event', methods=['POST'])
+def receive_event():
+    data = request.json
+    if not data:
+        return jsonify({"error": "No JSON payload"}), 400
+    
+    # On ajoute l'événement reçu à la file d'attente
+    event_buffer.append(data)
+    print(f"[API] Événement {data.get('id')} reçu via POST.")
+    
+    return jsonify({"status": "success", "message": "Event pushed to stream"}), 201
 
-            # 3. On répond à l'API de médiation avec un succès HTTP 200
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(b'{"status": "success", "message": "Ev\u00e9nement transmis \u00e0 Spark !"}')
-            print(f"[API] 200 OK - Evénement reçu et injecté dans Spark.")
+# ==========================================
+# 2. LE SERVEUR TCP (Ce que Spark écoute)
+# ==========================================
+def start_tcp_streamer():
+    HOST = '0.0.0.0'
+    PORT = 9999
+    
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind((HOST, PORT))
+    s.listen(1)
+    print(f"### [STREAMER] En attente du job Spark sur le port {PORT}... ###")
+    
+    conn, addr = s.accept()
+    print(f"✅ [STREAMER] Job Spark connecté depuis {addr} !")
+    
+    while True:
+        if event_buffer:
+            # On prend le premier événement de la file
+            event = event_buffer.pop(0)
+            # On l'envoie à Spark avec un saut de ligne
+            msg = json.dumps(event) + "\n"
+            try:
+                conn.sendall(msg.encode('utf-8'))
+                print(f"[STREAMER] Événement poussé vers Spark.")
+            except Exception as e:
+                print(f"❌ [STREAMER] Spark s'est déconnecté. ({str(e)})")
+                break
+        else:
+            time.sleep(0.5) # On attend que l'API reçoive des données
 
-        except Exception as e:
-            # Si Spark n'est pas allumé
-            self.send_response(500)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(b'{"status": "error", "message": "Spark indisponible."}')
-            print(f"[API] 500 ERREUR - Impossible de joindre Spark : {str(e)}")
+# Démarrage du streamer dans un thread parallèle
+threading.Thread(target=start_tcp_streamer, daemon=True).start()
 
-print("### DÉMARRAGE DE LA PASSERELLE API ###")
-print(f"-> Le serveur écoute en permanence sur http://localhost:{API_PORT}")
-print("-> En attente de requêtes POST (Médiation)...")
-
-server = HTTPServer(('0.0.0.0', API_PORT), WebhookAPI)
-try:
-    server.serve_forever()
-except KeyboardInterrupt:
-    print("\nArrêt de l'API.")
-    server.server_close()
+# Démarrage de l'API Web
+if __name__ == '__main__':
+    print("### DÉMARRAGE DE L'API DE MÉDIATION ###")
+    app.run(host='0.0.0.0', port=5000)
 ```
+*(Si tu n'as pas Flask, fais un petit `pip install flask` dans le terminal DevX).*
 
 ---
 
-### 2. Le Simulateur d'appels API (`simulateur_mediation.py`)
-Ce script représente l'application métier. Il fait des requêtes HTTP `POST` standard, exactement comme Postman ou un vrai service de la banque le ferait.
+### 2. Le Simulateur d'appels API (Le Testeur)
+
+Ce script remplace ton ancien générateur. Il se comporte comme n'importe quelle application métier : il fait des appels HTTP `POST` génériques.
+
+Crée un fichier **`simulateur_post.py`** :
 
 ```python
 import urllib.request
@@ -88,62 +97,53 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-# L'URL exposée par notre Serveur API
-API_URL = "http://127.0.0.1:8080"
+API_URL = "http://127.0.0.1:5000/api/event"
 
-print(f"### DÉMARRAGE DU SIMULATEUR DE MÉDIATION ###")
-print(f"-> Envoi de requêtes POST vers {API_URL}\n")
+print(f"### DÉMARRAGE DU SIMULATEUR D'APPELS API VERS {API_URL} ###")
 
 batch_num = 1
 try:
     while True:
-        # On crée un événement générique (JSON)
         now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + "Z"
-        event = {
-            "id": str(uuid.uuid4()),
-            "time": now,
-            "dh_poc_gen_timestamp": now
+        event_payload = {
+            "id": str(uuid.uuid4()), 
+            "time": now, 
+            "dh_poc_gen_timestamp": now,
+            "type": "generic_event"
         }
         
-        payload = json.dumps(event).encode('utf-8')
-        
-        # On prépare la requête HTTP POST classique
         req = urllib.request.Request(
             API_URL, 
-            data=payload, 
+            data=json.dumps(event_payload).encode('utf-8'), 
             headers={'Content-Type': 'application/json'}, 
             method='POST'
         )
         
         try:
             with urllib.request.urlopen(req) as response:
-                result = json.loads(response.read().decode('utf-8'))
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Appel {batch_num} : {result['status']} (Code {response.status})")
-        except urllib.error.HTTPError as e:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] ERREUR API : Code {e.code}")
-        except urllib.error.URLError:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] ERREUR : Le serveur API n'est pas allumé !")
-
-        batch_num += 1
+                if response.status == 201:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] -> POST API réussi (Event ID: {event_payload['id']})")
+        except Exception as e:
+            print(f"❌ Erreur d'appel API : {str(e)}")
+            
         time.sleep(2) # On simule un appel toutes les 2 secondes
-
+        
 except KeyboardInterrupt:
-    print("\n### ARRÊT DU SIMULATEUR ###")
+    print("\nArrêt du simulateur.")
 ```
 
 ---
 
-### 🚀 L'orchestration du test complet :
+### ⚠️ Le point critique de sécurité (K8s vs DevX)
 
-Pour que cette architecture de streaming pur fonctionne, tu dois ouvrir **3 terminaux** dans ton environnement DevX :
+Le protocole pour lancer ce PoC est le suivant :
+1. Tu lances `python api_gateway.py` (L'API tourne en tâche de fond).
+2. Tu lances ton job Spark (le code avec `format("socket")` de mon message précédent). **Mais attention :** si tu lances le job Spark sur le cluster Kubernetes (via le `submit.sh`), **le pod Kubernetes ne pourra probablement pas atteindre le port 9999 de ton DevX privé** (à cause des pare-feux).
+3. Tu lances `python simulateur_post.py`.
 
-1. **Terminal 1 :** Lance le code Spark de mon précédent message (`python main_cloudevent.py`). Il va ouvrir le port 9999 et attendre dans le vide.
-2. **Terminal 2 :** Lance la passerelle API (`python api_gateway.py`). Elle s'allume sur le port 8080 et tourne en permanence.
-3. **Terminal 3 :** Lance le simulateur (`python simulateur_mediation.py`). 
+Pour ce test d'API ultra-réactif, je te conseille de **lancer le job Spark directement dans un terminal DevX** (avec `python main_cloudevent.py`) plutôt que via K8s. Ainsi, l'API, le simulateur et Spark seront sur la même machine locale et pourront se parler instantanément.
 
-Tu vas voir le simulateur faire des `POST` sur le Terminal 2, le Terminal 2 les "pousser" silencieusement dans le Terminal 1, et Spark faire son `INSERT` vers Starburst !
-
-As-tu la possibilité d'ouvrir ces trois terminaux simultanément dans ton environnement DevX pour lancer ce test de bout en bout ?
+Veux-tu que je t'explique comment configurer ce PoC de manière à ce qu'il fonctionne même si Spark tourne sur le cluster Kubernetes distant ?
 
 
 C'est un excellent changement de paradigme ! Tu passes d'une architecture orientée "Fichiers" (Batch/Micro-batch) à une véritable architecture orientée "Événements Réseau" (Streaming pur). 
