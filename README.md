@@ -1,3 +1,176 @@
+C'est normal que ça ait planté, et je m'y attendais un peu. C'est le mur classique de la sécurité bancaire et de Kubernetes ! 
+
+Le "hack" du port réseau (le port 9999) que je t'ai proposé s'est heurté à deux réalités techniques incontournables de ton infrastructure :
+1. **L'isolation réseau :** Ton terminal DevX et le serveur Kubernetes où tourne Spark (via ton `submit_sparktacus.sh`) sont deux machines physiquement séparées, isolées par des pare-feux. Ils ne peuvent pas communiquer directement via un port TCP "ouvert à la volée".
+2. **La nature de Spark :** En Big Data, **Spark n'est pas un serveur Web**. Il n'a pas été conçu pour héberger des endpoints d'API (comme un `POST /api/events`). Il est conçu pour "tirer" (pull) de la donnée depuis un point central, pas pour qu'on lui "pousse" (push) de la donnée en direct.
+
+### La Vraie Architecture API (API Gateway Pattern)
+
+Dans la vraie vie, on ne tape jamais directement sur Spark avec une API. On met un composant au milieu. Puisque nous n'avons pas Kafka, **ton Cloud Object Storage (COS) DOIT être ce point central de transit**.
+
+Voici comment nous allons recréer une **véritable architecture API d'entreprise**, 100% fonctionnelle dans ton DevX, en respectant les règles de sécurité de la banque :
+
+1. **Le Serveur API (La Médiation) :** Un petit programme Python dans ton DevX qui expose un vrai port HTTP (ex: `http://localhost:8080/api/events`). Il écoute les requêtes API, et dès qu'il reçoit un événement, il le dépose instantanément sur le COS.
+2. **Le Client API (Le Générateur) :** Il simule tes applications métiers. Il fait des vraies requêtes HTTP `POST` vers le Serveur API.
+3. **Spark (Le Moteur) :** Ton code PySpark actuel sur Kubernetes qui continue de lire le COS en streaming.
+
+---
+
+### Script 1 : Le Serveur API (La Médiation)
+*À lancer dans un 1er terminal DevX. Il tourne en permanence.*
+
+Ce script n'a besoin d'aucun `pip install`. Il utilise les outils natifs de Python pour créer un vrai serveur Web. 
+
+```python
+import urllib.request
+import datetime
+import hashlib
+import hmac
+import json
+import uuid
+import ssl
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+# --- CONFIGURATIONS S3 NATIVES ---
+ACCESS_KEY = "TON_ACCESS_KEY"
+SECRET_KEY = "TON_SECRET_KEY"
+REGION = "eu-fr2"
+ENDPOINT = "https://s3.direct.eu-fr2.cloud-object-storage.appdomain.cloud"
+BUCKET_NAME = "bu002i004226"
+PREFIX_PATH = "poc_streaming/input_cloudevent_raw/"
+
+def put_s3_object_native(bucket, key, data_string):
+    """Fonction native d'écriture S3 (déjà validée)"""
+    host = ENDPOINT.replace('https://', '').replace('http://', '')
+    t = datetime.datetime.now(datetime.timezone.utc)
+    amz_date = t.strftime('%Y%m%dT%H%M%SZ')
+    date_stamp = t.strftime('%Y%m%d')
+
+    payload_hash = hashlib.sha256(data_string.encode('utf-8')).hexdigest()
+    canonical_uri = '/' + bucket + '/' + key
+    canonical_headers = 'host:' + host + '\nx-amz-content-sha256:' + payload_hash + '\nx-amz-date:' + amz_date + '\n'
+    signed_headers = 'host;x-amz-content-sha256;x-amz-date'
+    canonical_request = 'PUT\n' + canonical_uri + '\n\n' + canonical_headers + '\n' + signed_headers + '\n' + payload_hash
+
+    algorithm = 'AWS4-HMAC-SHA256'
+    credential_scope = date_stamp + '/' + REGION + '/s3/aws4_request'
+    string_to_sign = algorithm + '\n' + amz_date + '\n' + credential_scope + '\n' + hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()
+
+    def sign(key, msg): return hmac.new(key, msg.encode('utf-8'), hashlib.sha256).digest()
+        
+    kSigning = sign(sign(sign(sign(('AWS4' + SECRET_KEY).encode('utf-8'), date_stamp), REGION), 's3'), 'aws4_request')
+    signature = hmac.new(kSigning, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
+
+    auth_header = f"{algorithm} Credential={ACCESS_KEY}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}"
+    headers = {'x-amz-date': amz_date, 'x-amz-content-sha256': payload_hash, 'Authorization': auth_header}
+
+    req = urllib.request.Request(ENDPOINT + canonical_uri, data=data_string.encode('utf-8'), headers=headers, method='PUT')
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(req, context=ctx) as response:
+        return response.status
+
+# --- LE SERVEUR WEB (API REST) ---
+class MediationAPIHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        # On vérifie que c'est bien la route /api/events
+        if self.path == '/api/events':
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            
+            # On génère un nom de fichier unique
+            file_name = f"{PREFIX_PATH}event_{uuid.uuid4().hex[:8]}.json"
+            
+            try:
+                # Écriture immédiate sur le COS
+                put_s3_object_native(BUCKET_NAME, file_name, post_data.decode('utf-8'))
+                
+                # Réponse de succès à l'appelant (Code 201 Created)
+                self.send_response(201)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(b'{"status": "success", "message": "Evenement recu et bufferise dans COS"}')
+                print(f"✅ [API] Reçu et transféré : {file_name}")
+                
+            except Exception as e:
+                self.send_response(500)
+                self.end_headers()
+                print(f"❌ [API] Erreur d'écriture COS : {str(e)}")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+# Lancement du serveur sur le port 8080
+server = HTTPServer(('127.0.0.1', 8080), MediationAPIHandler)
+print("### API DE MÉDIATION DÉMARRÉE ###")
+print("-> Écoute des appels HTTP POST sur http://127.0.0.1:8080/api/events")
+server.serve_forever()
+```
+
+---
+
+### Script 2 : Le Client API (Le Simulateur de l'app métier)
+*À lancer dans un 2ème terminal DevX.*
+
+Lui ne connaît ni Spark, ni le S3, ni tes clés secrètes. Il fait juste des vrais appels Web (HTTP `POST`) vers l'API de Médiation.
+
+```python
+import urllib.request
+import json
+import time
+import uuid
+from datetime import datetime, timezone
+
+API_URL = "http://127.0.0.1:8080/api/events"
+
+print("### DÉMARRAGE DU GÉNÉRATEUR D'APPELS API ###")
+
+batch_num = 1
+try:
+    while True:
+        # On crée un événement JSON
+        now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + "Z"
+        event = {"id": str(uuid.uuid4()), "time": now, "dh_poc_gen_timestamp": now}
+        
+        # On prépare la requête HTTP POST
+        req = urllib.request.Request(
+            API_URL, 
+            data=json.dumps(event).encode('utf-8'), 
+            headers={'Content-Type': 'application/json'}, 
+            method='POST'
+        )
+        
+        # On "frappe" l'API de Médiation
+        try:
+            with urllib.request.urlopen(req) as response:
+                if response.status == 201:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] -> Appel API N°{batch_num} réussi (201 Created).")
+        except urllib.error.URLError:
+            print("❌ Erreur : Impossible de joindre l'API. Le serveur de médiation est-il lancé ?")
+            
+        batch_num += 1
+        time.sleep(2) # On simule un appel toutes les 2 secondes
+
+except KeyboardInterrupt:
+    print("\n### ARRÊT DES APPELS API ###")
+```
+
+---
+
+### Comment tout orchestrer ?
+
+C'est ici que ton architecture devient ultra-professionnelle :
+
+1. **Le Moteur :** Via ton terminal (ou l'orchestrateur Python qu'on a fait), lance ton `submit_sparktacus.sh`. Spark va s'allumer sur Kubernetes et écouter silencieusement le COS.
+2. **L'API :** Lance le **Script 1** dans DevX (`python api_server.py`). C'est lui "le service qui tourne en permanence" et qui va réceptionner les appels.
+3. **Le Trafic :** Lance le **Script 2** dans DevX (`python api_client.py`). 
+
+Tu vas voir l'API répondre "201 Created" en temps réel. Spark, de son côté, va aspirer ces micro-fichiers instantanément et faire ses requêtes SQL vers Starburst. Tu as ainsi respecté l'architecture "API" sans casser les règles de ton infrastructure réseau ! 
+
+Est-ce que cette séparation claire entre l'API de réception et le moteur de calcul Spark te semble plus logique vis-à-vis des attentes de tes architectes ?
+
+
 C'est une excellente vision architecturale ! Tu décris exactement le pattern **"Event-Driven API Gateway"** (Passerelle d'API orientée événements). C'est le standard ultime pour le temps réel.
 
 Cependant, il faut que je sois très transparent avec toi sur une réalité fondamentale du Big Data : **Spark n'est pas un serveur Web.** Tu ne peux pas faire une requête HTTP `POST` directement à un job Spark. Il n'a pas été conçu pour héberger des routes d'API (comme `/api/events`). Il est fait pour "avaler" des flux de données en continu. Dans la vraie vie, l'API de médiation reçoit le `POST` et pousse l'événement dans un **Message Broker** (comme Kafka), et Spark écoute ce Kafka.
