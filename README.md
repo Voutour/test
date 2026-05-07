@@ -1,3 +1,334 @@
+Parfait, c'est clair maintenant. Laisse-moi récapituler proprement et te proposer une solution réaliste.
+
+## Récapitulatif de la cible
+
+- **Pod Spark long-running** sur K8s (un seul `spark-submit` au démarrage).
+- **API de déclenchement** : depuis DevX, on appelle "fais le traitement".
+- **Action** : à la réception, le pod lit les nouveaux fichiers JSON sur COS (lecture autorisée), les transforme avec Spark, puis fait un `INSERT` Trino vers la table Iceberg `source_a`. **Aucun PUT sur COS**, c'est Trino qui écrit dans Iceberg.
+- **Contraintes** : stdlib Python uniquement, pas de Service K8s, pas de Kafka.
+
+## Le vrai problème : comment le pod reçoit la commande sans Service K8s ?
+
+Sans Service, **personne depuis l'extérieur ne peut taper une URL HTTP sur ton pod**. Le pod Spark a une IP interne au cluster qui n'est pas routable depuis DevX, et qui change à chaque redémarrage.
+
+Tu as 3 options réalistes. Je te les liste honnêtement avec leurs forces/faiblesses :
+
+### Option A — `kubectl port-forward` depuis DevX (push)
+
+DevX a `kubectl` configuré (ton `submit_sparktacus.sh` le prouve). Donc **le client de test** peut faire :
+
+```bash
+kubectl port-forward pod/<driver-pod> 8080:8080 -n $NAMESPACE
+curl -X POST http://localhost:8080/trigger -d '{"window_minutes": 10}'
+```
+
+Le pod expose un serveur HTTP (`http.server` de la stdlib) sur `0.0.0.0:8080`, et `port-forward` crée un tunnel temporaire.
+
+✅ Vraie API push, latence quasi nulle, pas de polling.
+✅ 100% stdlib (`http.server`).
+✅ Pas besoin de Service K8s.
+❌ Le client doit avoir kubectl + droits `pod/portforward` sur le namespace (à vérifier).
+❌ Si le pod redémarre, il faut récupérer le nouveau nom de pod.
+
+### Option B — Polling depuis le pod Spark (pull)
+
+Le pod interroge périodiquement une table Starburst de "commandes" (ou un endpoint HTTP que DevX expose). Quand une nouvelle ligne apparaît avec `status='PENDING'`, le pod la traite et la passe à `'DONE'`.
+
+✅ Aucun port à exposer, aucun Service, aucun port-forward.
+✅ Survit aux redémarrages du pod sans rien reconfigurer.
+❌ Ce n'est pas vraiment une API : c'est de l'asynchrone avec une latence = intervalle de polling (typiquement 5-30s).
+❌ Le client doit pouvoir écrire dans une table Starburst (probablement OK puisque Trino est ton hub).
+
+### Option C — Hybride : port-forward + fallback polling
+
+Trop compliqué pour un POC, on l'écarte.
+
+## Ma recommandation
+
+Je pars sur **l'Option A (port-forward + serveur HTTP stdlib dans le pod)**. C'est la seule qui correspond vraiment à *"je veux appeler l'app par API"* tel que tu l'as formulé. Tu valides l'archi, et si plus tard tu obtiens le droit de créer un Service, tu retires juste le `port-forward`, le serveur HTTP reste identique.
+
+Si tes droits ne te permettent pas le `port-forward`, on bascule sur l'Option B en 5 minutes.
+
+## Le code
+
+Voici la version refactorée. J'ai gardé la structure de ton `main_cloudevent.py` mais j'ai changé la mécanique de déclenchement et corrigé les problèmes critiques qu'on avait listés (plus de `collect()` brut, plus de mot de passe en dur, requêtes paramétrables, etc.).
+
+### `main_cloudevent.py` (version API-driven)
+
+```python
+import os
+import sys
+import ssl
+import json
+import base64
+import threading
+import urllib.request
+from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import current_timestamp, col, input_file_name
+from pyspark.sql.types import StructType, StructField, StringType
+
+# ============================================================
+# 1. CONFIGURATION (via env vars — plus de secrets en clair)
+# ============================================================
+STARBURST_USER = os.environ["STARBURST_USER"]
+STARBURST_PASS = os.environ["STARBURST_PASS"]
+TRINO_HOST     = os.environ.get("TRINO_HOST", "starburst-ap63215-dev-8850c885.data.cloud.net.intra")
+TRINO_PORT     = int(os.environ.get("TRINO_PORT", "443"))
+
+S3_RAW_PATH    = os.environ["S3_RAW_PATH"]   # s3a://.../input_cloudevent_raw/
+TARGET_TABLE   = os.environ.get("TARGET_TABLE", "dh_poc_ice.pocstream.cloudevent_raw")
+
+API_PORT       = int(os.environ.get("API_PORT", "8080"))
+DEFAULT_WINDOW = int(os.environ.get("DEFAULT_WINDOW_MINUTES", "10"))
+INSERT_CHUNK   = int(os.environ.get("INSERT_CHUNK_SIZE", "500"))  # lignes / INSERT Trino
+
+# ============================================================
+# 2. SPARK SESSION (long-running, partagée par toutes les requêtes)
+# ============================================================
+spark = (
+    SparkSession.builder
+        .appName("PoC-Spark-API-Driven")
+        .getOrCreate()
+)
+spark.sparkContext.setLogLevel("WARN")
+
+SCHEMA_EVENTS = StructType([
+    StructField("id", StringType(), True),
+    StructField("time", StringType(), True),
+    StructField("dh_poc_gen_timestamp", StringType(), True),
+])
+
+# ============================================================
+# 3. CLIENT TRINO (stdlib uniquement)
+# ============================================================
+def execute_trino_query(query: str) -> bool:
+    """Envoie une requête SQL à Trino/Starburst via l'API REST."""
+    url = f"https://{TRINO_HOST}:{TRINO_PORT}/v1/statement"
+    auth = base64.b64encode(f"{STARBURST_USER}:{STARBURST_PASS}".encode()).decode()
+    headers = {
+        "X-Trino-User": STARBURST_USER,
+        "Authorization": f"Basic {auth}",
+        "Content-Type": "text/plain",
+    }
+    # ⚠️ POC: TLS verify désactivé. À remplacer par un CA bundle en prod.
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    req = urllib.request.Request(url, data=query.encode("utf-8"), headers=headers, method="POST")
+    with urllib.request.urlopen(req, context=ctx) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    if "error" in data:
+        raise RuntimeError(f"Trino error: {data['error']['message']}")
+
+    # Suivre les nextUri jusqu'à la fin
+    while "nextUri" in data:
+        nreq = urllib.request.Request(data["nextUri"], headers=headers, method="GET")
+        with urllib.request.urlopen(nreq, context=ctx) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if "error" in data:
+            raise RuntimeError(f"Trino error: {data['error']['message']}")
+    return True
+
+# ============================================================
+# 4. SQL HELPERS — quoting safe
+# ============================================================
+def sql_escape(value) -> str:
+    """Échappe une valeur pour insertion SQL Trino. Stop la concaténation naïve."""
+    if value is None:
+        return "NULL"
+    s = str(value).replace("'", "''")
+    return f"'{s}'"
+
+def build_insert(rows_chunk) -> str:
+    values_lines = []
+    for r in rows_chunk:
+        if r["id"] is None:
+            continue
+        t3_str = r["dh_poc_spark_read_timestamp"].strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        values_lines.append(
+            f"({sql_escape(r['id'])}, "
+            f"{sql_escape(r['time'])}, "
+            f"{sql_escape(r['dh_poc_gen_timestamp'])}, "
+            f"TIMESTAMP {sql_escape(t3_str)})"
+        )
+    if not values_lines:
+        return ""
+    values_sql = ",\n".join(values_lines)
+    return (
+        f"INSERT INTO {TARGET_TABLE} "
+        f"(id, time, dh_poc_gen_timestamp, dh_poc_spark_read_timestamp) "
+        f"VALUES {values_sql}"
+    )
+
+# ============================================================
+# 5. CŒUR DU TRAITEMENT (appelé par chaque requête API)
+# ============================================================
+# Lock pour empêcher 2 traitements simultanés sur le même Spark context
+_processing_lock = threading.Lock()
+
+def process_window(window_minutes: int) -> dict:
+    """
+    Lit les fichiers du bucket déposés dans la fenêtre demandée,
+    les transforme, et insère via Trino.
+    """
+    with _processing_lock:
+        started = datetime.utcnow()
+        cutoff = started - timedelta(minutes=window_minutes)
+
+        # Lecture BATCH (pas streaming) — on traite ce qui est là, on rend la main.
+        df = (
+            spark.read
+                 .schema(SCHEMA_EVENTS)
+                 .option("mode", "PERMISSIVE")
+                 .json(S3_RAW_PATH)
+                 .withColumn("dh_poc_spark_read_timestamp", current_timestamp())
+                 .withColumn("_source_file", input_file_name())
+        )
+        # Filtre temporel : si tu as un champ event_time fiable, filtre dessus.
+        # Ici, à défaut, on traite tout — adapte selon ta logique métier.
+        # df = df.filter(col("time") >= cutoff.isoformat())
+
+        total = df.count()
+        if total == 0:
+            return {"status": "ok", "rows_inserted": 0, "message": "no data"}
+
+        # Insertion par chunks via toLocalIterator: pas de collect() global.
+        inserted = 0
+        chunk = []
+        for row in df.toLocalIterator():
+            chunk.append(row.asDict())
+            if len(chunk) >= INSERT_CHUNK:
+                sql = build_insert(chunk)
+                if sql:
+                    execute_trino_query(sql)
+                    inserted += len(chunk)
+                chunk = []
+        if chunk:
+            sql = build_insert(chunk)
+            if sql:
+                execute_trino_query(sql)
+                inserted += len(chunk)
+
+        elapsed = (datetime.utcnow() - started).total_seconds()
+        return {
+            "status": "ok",
+            "rows_inserted": inserted,
+            "total_seen": total,
+            "window_minutes": window_minutes,
+            "elapsed_seconds": elapsed,
+        }
+
+# ============================================================
+# 6. SERVEUR HTTP (stdlib http.server)
+# ============================================================
+class TriggerHandler(BaseHTTPRequestHandler):
+    def _json(self, code: int, payload: dict):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/health":
+            return self._json(200, {"status": "alive"})
+        return self._json(404, {"error": "not found"})
+
+    def do_POST(self):
+        if self.path != "/trigger":
+            return self._json(404, {"error": "not found"})
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            payload = json.loads(raw or b"{}")
+        except json.JSONDecodeError:
+            return self._json(400, {"error": "invalid json"})
+
+        window = int(payload.get("window_minutes", DEFAULT_WINDOW))
+        try:
+            result = process_window(window)
+            return self._json(200, result)
+        except Exception as e:
+            return self._json(500, {"error": str(e)})
+
+    def log_message(self, fmt, *args):
+        # Redirige les logs HTTP vers stdout pour kubectl logs
+        sys.stdout.write(f"[HTTP] {fmt % args}\n")
+
+def serve_forever():
+    httpd = HTTPServer(("0.0.0.0", API_PORT), TriggerHandler)
+    print(f"### API listening on 0.0.0.0:{API_PORT} ###", flush=True)
+    httpd.serve_forever()
+
+# ============================================================
+# 7. MAIN — démarre l'API et bloque
+# ============================================================
+if __name__ == "__main__":
+    print(f"### Spark session ready, target table: {TARGET_TABLE} ###", flush=True)
+    print(f"### Listening for triggers, raw path: {S3_RAW_PATH} ###", flush=True)
+    serve_forever()  # bloque indéfiniment, garde le pod vivant
+```
+
+### Côté `submit_sparktacus.sh` — 2 ajouts
+
+**Variables d'env pour les secrets** (à monter via K8s Secret) :
+
+```bash
+--conf spark.kubernetes.driverEnv.STARBURST_USER=$STARBURST_USER \
+--conf spark.kubernetes.driverEnv.STARBURST_PASS=$STARBURST_PASS \
+--conf spark.kubernetes.driverEnv.S3_RAW_PATH=$S3_RAW_PATH \
+```
+
+Idéalement remplace ça par `secretKeyRef` :
+```bash
+--conf spark.kubernetes.driver.secrets.starburst-creds=/etc/secrets/starburst \
+```
+
+### Côté DevX — déclenchement
+
+```bash
+# 1. Récupérer le nom du pod driver
+DRIVER_POD=$(kubectl get pods -n $NAMESPACE \
+    -l spark-role=driver,spark-app-name=poc-streaming-sparktacus \
+    -o jsonpath='{.items[0].metadata.name}')
+
+# 2. Ouvrir le tunnel (en arrière-plan, ou dans un autre terminal)
+kubectl port-forward -n $NAMESPACE pod/$DRIVER_POD 8080:8080 &
+
+# 3. Déclencher
+curl -X POST http://localhost:8080/trigger \
+     -H "Content-Type: application/json" \
+     -d '{"window_minutes": 10}'
+
+# Réponse:
+# {"status":"ok","rows_inserted":1234,"total_seen":1234,"window_minutes":10,"elapsed_seconds":4.2}
+```
+
+## Points d'attention sur cette version
+
+1. **Plus de `readStream`** : tu m'as dit *"appel API qui déclenche le traitement"*, donc ce n'est plus du streaming continu mais du **batch à la demande**. Ça correspond mieux à ta contrainte — et incidemment ça résout le problème des petits fichiers Iceberg.
+
+2. **Le `_processing_lock`** empêche deux requêtes API simultanées de lancer deux jobs Spark en parallèle sur le même driver (ça partirait en compétition pour les ressources). Si une seconde requête arrive pendant un traitement, elle attend.
+
+3. **`toLocalIterator()` au lieu de `collect()`** : ramène les lignes par partition au lieu de tout d'un coup. Bien plus safe en mémoire.
+
+4. **Filtre temporel** : la lecture batch relit **tous** les fichiers du bucket à chaque appel. Pour vraiment ne traiter que la fenêtre demandée, il faut un filtre — soit sur un champ `event_time` du payload, soit via `modifiedAfter` côté Spark (option de la file source). Dis-moi quel champ tu veux utiliser et je te l'ajoute.
+
+5. **Vérifie tes droits `pod/portforward`** sur le namespace avant tout :
+   ```bash
+   kubectl auth can-i create pods/portforward -n $NAMESPACE
+   ```
+   Si c'est `no`, on bascule sur l'Option B (polling).
+
+Tu veux que j'enchaîne sur quoi : le manifest pour les K8s Secrets, la version polling au cas où le port-forward ne passerait pas, ou l'ajout du filtre temporel propre ?
+
+
+
 Parfait, avec ces réponses la solution se dessine nettement. Voici ce que je te propose, puis le code.
 
 ## Architecture proposée
