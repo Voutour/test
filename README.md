@@ -1,3 +1,257 @@
+Pas de souci. Voici la version sans variables d'environnement — config en dur dans le code, comme ton POC actuel. C'est juste pour tester, on remettra les env vars / secrets après.
+
+```python
+import sys
+import ssl
+import json
+import base64
+import threading
+import urllib.request
+from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import current_timestamp, input_file_name
+from pyspark.sql.types import StructType, StructField, StringType
+
+# ============================================================
+# 1. CONFIGURATION (en dur — POC uniquement)
+# ============================================================
+STARBURST_USER = "j17990"
+STARBURST_PASS = "vovsic3P*"
+TRINO_HOST     = "starburst-ap63215-dev-8850c885.data.cloud.net.intra"
+TRINO_PORT     = 443
+
+S3_RAW_PATH    = "s3a://bu002i004226/poc_streaming/input_cloudevent_raw/"
+TARGET_TABLE   = "dh_poc_ice.pocstream.cloudevent_raw"
+
+API_PORT       = 8080
+DEFAULT_WINDOW = 10        # minutes
+INSERT_CHUNK   = 500       # lignes par INSERT Trino
+
+# ============================================================
+# 2. SPARK SESSION (long-running, partagée par toutes les requêtes)
+# ============================================================
+spark = (
+    SparkSession.builder
+        .appName("PoC-Spark-API-Driven")
+        .getOrCreate()
+)
+spark.sparkContext.setLogLevel("WARN")
+
+SCHEMA_EVENTS = StructType([
+    StructField("id", StringType(), True),
+    StructField("time", StringType(), True),
+    StructField("dh_poc_gen_timestamp", StringType(), True),
+])
+
+# ============================================================
+# 3. CLIENT TRINO (stdlib uniquement)
+# ============================================================
+def execute_trino_query(query: str) -> bool:
+    """Envoie une requête SQL à Trino/Starburst via l'API REST."""
+    url = f"https://{TRINO_HOST}:{TRINO_PORT}/v1/statement"
+    auth = base64.b64encode(f"{STARBURST_USER}:{STARBURST_PASS}".encode()).decode()
+    headers = {
+        "X-Trino-User": STARBURST_USER,
+        "Authorization": f"Basic {auth}",
+        "Content-Type": "text/plain",
+    }
+    # POC : TLS verify désactivé. À remplacer par un CA bundle en prod.
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    req = urllib.request.Request(url, data=query.encode("utf-8"), headers=headers, method="POST")
+    with urllib.request.urlopen(req, context=ctx) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    if "error" in data:
+        raise RuntimeError(f"Trino error: {data['error']['message']}")
+
+    # Suivre les nextUri jusqu'à la fin
+    while "nextUri" in data:
+        nreq = urllib.request.Request(data["nextUri"], headers=headers, method="GET")
+        with urllib.request.urlopen(nreq, context=ctx) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if "error" in data:
+            raise RuntimeError(f"Trino error: {data['error']['message']}")
+    return True
+
+# ============================================================
+# 4. SQL HELPERS — quoting safe
+# ============================================================
+def sql_escape(value) -> str:
+    """Échappe une valeur pour insertion SQL Trino."""
+    if value is None:
+        return "NULL"
+    s = str(value).replace("'", "''")
+    return f"'{s}'"
+
+def build_insert(rows_chunk) -> str:
+    values_lines = []
+    for r in rows_chunk:
+        if r["id"] is None:
+            continue
+        t3_str = r["dh_poc_spark_read_timestamp"].strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        values_lines.append(
+            f"({sql_escape(r['id'])}, "
+            f"{sql_escape(r['time'])}, "
+            f"{sql_escape(r['dh_poc_gen_timestamp'])}, "
+            f"TIMESTAMP {sql_escape(t3_str)})"
+        )
+    if not values_lines:
+        return ""
+    values_sql = ",\n".join(values_lines)
+    return (
+        f"INSERT INTO {TARGET_TABLE} "
+        f"(id, time, dh_poc_gen_timestamp, dh_poc_spark_read_timestamp) "
+        f"VALUES {values_sql}"
+    )
+
+# ============================================================
+# 5. CŒUR DU TRAITEMENT (appelé par chaque requête API)
+# ============================================================
+_processing_lock = threading.Lock()  # empêche 2 traitements simultanés
+
+def process_window(window_minutes: int) -> dict:
+    """
+    Lit les fichiers du bucket, les transforme, et insère via Trino.
+    """
+    with _processing_lock:
+        started = datetime.utcnow()
+
+        df = (
+            spark.read
+                 .schema(SCHEMA_EVENTS)
+                 .option("mode", "PERMISSIVE")
+                 .json(S3_RAW_PATH)
+                 .withColumn("dh_poc_spark_read_timestamp", current_timestamp())
+                 .withColumn("_source_file", input_file_name())
+        )
+        # TODO : ajouter un filtre temporel sur `time` ou sur la modif date du fichier
+        # selon la sémantique exacte de "events depuis X minutes"
+
+        total = df.count()
+        if total == 0:
+            return {"status": "ok", "rows_inserted": 0, "message": "no data"}
+
+        # Insertion par chunks via toLocalIterator : pas de collect() global
+        inserted = 0
+        chunk = []
+        for row in df.toLocalIterator():
+            chunk.append(row.asDict())
+            if len(chunk) >= INSERT_CHUNK:
+                sql = build_insert(chunk)
+                if sql:
+                    execute_trino_query(sql)
+                    inserted += len(chunk)
+                chunk = []
+        if chunk:
+            sql = build_insert(chunk)
+            if sql:
+                execute_trino_query(sql)
+                inserted += len(chunk)
+
+        elapsed = (datetime.utcnow() - started).total_seconds()
+        return {
+            "status": "ok",
+            "rows_inserted": inserted,
+            "total_seen": total,
+            "window_minutes": window_minutes,
+            "elapsed_seconds": elapsed,
+        }
+
+# ============================================================
+# 6. SERVEUR HTTP (stdlib http.server)
+# ============================================================
+class TriggerHandler(BaseHTTPRequestHandler):
+    def _json(self, code: int, payload: dict):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/health":
+            return self._json(200, {"status": "alive"})
+        return self._json(404, {"error": "not found"})
+
+    def do_POST(self):
+        if self.path != "/trigger":
+            return self._json(404, {"error": "not found"})
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            payload = json.loads(raw or b"{}")
+        except json.JSONDecodeError:
+            return self._json(400, {"error": "invalid json"})
+
+        window = int(payload.get("window_minutes", DEFAULT_WINDOW))
+        try:
+            result = process_window(window)
+            return self._json(200, result)
+        except Exception as e:
+            return self._json(500, {"error": str(e)})
+
+    def log_message(self, fmt, *args):
+        sys.stdout.write(f"[HTTP] {fmt % args}\n")
+
+def serve_forever():
+    httpd = HTTPServer(("0.0.0.0", API_PORT), TriggerHandler)
+    print(f"### API listening on 0.0.0.0:{API_PORT} ###", flush=True)
+    httpd.serve_forever()
+
+# ============================================================
+# 7. MAIN
+# ============================================================
+if __name__ == "__main__":
+    print(f"### Spark session ready, target table: {TARGET_TABLE} ###", flush=True)
+    print(f"### Listening for triggers, raw path: {S3_RAW_PATH} ###", flush=True)
+    serve_forever()  # bloque indéfiniment, garde le pod vivant
+```
+
+## Comment tester depuis DevX
+
+```bash
+# 1. Lancer le job une fois
+./submit_sparktacus.sh
+
+# 2. Récupérer le nom du pod driver
+DRIVER_POD=$(kubectl get pods -n $NAMESPACE \
+    -l spark-role=driver \
+    -o jsonpath='{.items[0].metadata.name}')
+
+# 3. Ouvrir le tunnel
+kubectl port-forward -n $NAMESPACE pod/$DRIVER_POD 8080:8080 &
+
+# 4. Tester health
+curl http://localhost:8080/health
+# {"status":"alive"}
+
+# 5. Déclencher un traitement
+curl -X POST http://localhost:8080/trigger \
+     -H "Content-Type: application/json" \
+     -d '{"window_minutes": 10}'
+# {"status":"ok","rows_inserted":42,"total_seen":42,"window_minutes":10,"elapsed_seconds":3.1}
+```
+
+## Choses à valider de ton côté avant de lancer
+
+1. **Vérifier les droits port-forward** :
+   ```bash
+   kubectl auth can-i create pods/portforward -n $NAMESPACE
+   ```
+   Si la réponse est `no`, dis-le-moi tout de suite, on bascule sur la version polling.
+
+2. **Le port 8080 dans le pod** : pas besoin d'exposition K8s spéciale, `port-forward` ouvre directement le port du conteneur. Mais vérifie qu'aucun autre process Spark ne l'utilise déjà (la Spark UI est sur 4040 par défaut, donc pas de conflit).
+
+3. **`fanout` sur le `submit_sparktacus.sh`** : tu peux laisser `spark.ui.enabled=false` ou le repasser à `true` pour debug.
+
+Quand tu auras testé, dis-moi ce que ça donne et on itère sur le filtre temporel ou la version polling si besoin.
+
+
 Parfait, c'est clair maintenant. Laisse-moi récapituler proprement et te proposer une solution réaliste.
 
 ## Récapitulatif de la cible
