@@ -1,3 +1,156 @@
+Parfait, tout est clair. Voici le guide complet pour ton POC.
+
+## Architecture du POC
+
+```
+VS Code + Continue
+       │
+       ├── Prompt utilisateur ("Crée une page Confluence pour…")
+       │
+       ▼
+   Continue (config MCP)
+       │
+       ▼
+Atlassian Remote MCP Server (cloud, OAuth)
+       │
+       ▼
+  Confluence Cloud → page créée avec format riche
+```
+
+## Étape 1 — Vérifier les prérequis Confluence
+
+Avant tout : le MCP Remote officiel d'Atlassian **ne fonctionne qu'avec Atlassian Cloud** (pas Data Center/Server). Vérifie que ton instance est bien `*.atlassian.net`. Si ton instance est `confluence.group.echonet` (l'URL des screenshots), c'est probablement on-premise et il faudra basculer sur `mcp-atlassian` (sooperset) en self-hosted. À garder en tête.
+
+## Étape 2 — Configurer Continue avec le MCP Atlassian
+
+Dans VS Code, ouvre la config Continue (`Ctrl+Shift+P` → "Continue: Open config.yaml" ou `~/.continue/config.yaml`).
+
+Ajoute le serveur MCP Atlassian :
+
+```yaml
+name: Local Assistant
+version: 1.0.0
+schema: v1
+
+models:
+  - name: Claude Sonnet 4.6
+    provider: anthropic
+    model: claude-sonnet-4-5
+    apiKey: <ta-clé-anthropic>
+    roles:
+      - chat
+      - edit
+
+mcpServers:
+  - name: atlassian
+    command: npx
+    args:
+      - -y
+      - mcp-remote
+      - https://mcp.atlassian.com/v1/sse
+```
+
+Pourquoi `mcp-remote` ? Continue (et la plupart des clients MCP) parlent en stdio. Le serveur Atlassian est en SSE distant. `mcp-remote` est un proxy local qui fait le pont **et** gère le flow OAuth automatiquement.
+
+Au premier lancement, une fenêtre navigateur s'ouvre → tu te connectes à Atlassian → tu autorises l'app → token stocké localement. Ensuite Continue voit les outils Atlassian.
+
+## Étape 3 — Comprendre le format Confluence (le piège critique)
+
+C'est là que la plupart des POC échouent. Confluence Cloud n'accepte **pas du Markdown brut** pour les pages. Il faut du **storage format** (XHTML enrichi avec macros `<ac:…>`).
+
+Exemple d'éléments :
+
+```xml
+<h1>Titre principal</h1>
+<h2>Section</h2>
+<h3>Sous-section</h3>
+
+<p>Paragraphe simple avec <strong>gras</strong> et <em>italique</em>.</p>
+
+<ul>
+  <li>Item de liste</li>
+  <li>Autre item</li>
+</ul>
+
+<table>
+  <tbody>
+    <tr><th>Colonne 1</th><th>Colonne 2</th></tr>
+    <tr><td>val1</td><td>val2</td></tr>
+  </tbody>
+</table>
+
+<ac:structured-macro ac:name="code">
+  <ac:parameter ac:name="language">python</ac:parameter>
+  <ac:plain-text-body><![CDATA[
+def hello():
+    print("Hello CTDF")
+  ]]></ac:plain-text-body>
+</ac:structured-macro>
+
+<ac:structured-macro ac:name="info">
+  <ac:rich-text-body>
+    <p>Bloc d'information mis en avant.</p>
+  </ac:rich-text-body>
+</ac:structured-macro>
+```
+
+Le MCP Atlassian officiel expose `createPage` / `updatePage` qui acceptent ce format. Tu peux aussi lui passer du markdown et il convertit, mais le résultat est moins prévisible sur les macros complexes (tableaux, code blocks avec syntaxe). **Pour un POC de démo, génère du storage format directement.**
+
+## Étape 4 — Le prompt qui fait le job
+
+Voici un prompt à coller dans Continue. Il est construit pour que Claude génère le bon format du premier coup.
+
+```
+Tu es un assistant qui crée des pages Confluence via le MCP Atlassian.
+
+Crée une nouvelle page dans l'espace [SPACE_KEY] avec :
+- Titre : "POC Agentic DPGen — Design Document Pipeline Ventes"
+- Parent page : [PARENT_PAGE_ID ou laisse vide]
+
+Le contenu doit être au format Confluence storage (XHTML) avec :
+
+1. Un H1 "1. Contexte" suivi d'un paragraphe expliquant l'objectif
+2. Un H1 "2. Architecture" avec :
+   - Un H2 "2.1 Composants" et une liste à puces de 4 composants
+   - Un H2 "2.2 Flux de données" avec un tableau (3 colonnes : Étape, Source, Cible)
+3. Un H1 "3. Implémentation" avec :
+   - Un H2 "3.1 Code DAG Airflow" suivi d'un bloc de code Python (macro code)
+   - Un H2 "3.2 Configuration" suivi d'un bloc de code YAML
+4. Un H1 "4. Tests" avec un H3 "4.1 Tests unitaires" et un H3 "4.2 Tests d'intégration"
+5. Un panneau info (macro info) en fin de page rappelant que la page est générée par AiDPGen
+
+Utilise les macros Confluence : code (avec ac:parameter language), info, et table avec <tbody>/<th>/<td>.
+Génère le storage format complet, puis appelle l'outil createPage du MCP Atlassian.
+```
+
+## Étape 5 — Tester progressivement
+
+Je te conseille trois itérations pour limiter les surprises :
+
+**Itération 1 — Sanity check** : prompt minimal "Liste les espaces Confluence auxquels j'ai accès". Si ça répond, le MCP est OK.
+
+**Itération 2 — Page simple** : "Crée une page intitulée Test MCP dans l'espace XXX avec un titre H1 et deux paragraphes". Valide l'écriture.
+
+**Itération 3 — Page complète** : le prompt ci-dessus.
+
+## Étape 6 — Améliorations pour la démo
+
+Pour rendre le POC parlant lors de la présentation :
+
+- **Source de vérité dans la conversation** : avant le prompt de création, demande à Continue de lire d'abord un fichier `pipeline_spec.md` local (la spec brute du dev), puis de la transformer en design doc Confluence structurée. Ça illustre vraiment le rôle "agent" qui traduit du contenu brut en doc formatée.
+- **Trace dans JIRA** : ajoute aussi le MCP JIRA et fais commenter le ticket associé avec le lien vers la page créée. Boucle fermée, c'est exactement ton angle "closing the loop".
+- **Diagramme Mermaid** : la doc CTDF mentionne que Confluence rend Mermaid (via macro HTML). Demande à l'agent d'inclure un diagramme Mermaid dans la page (flow source → mediation → ingestion → storage). Très visuel pour la démo.
+
+## Points de vigilance
+
+Quelques pièges à anticiper :
+- Premier appel = OAuth navigateur ; prévois 2 minutes la première fois.
+- L'espace et la page parent doivent exister ; l'agent ne les crée pas automatiquement.
+- Les macros mal formées (CDATA, balises non fermées) renvoient une 400 ; si ça plante, demande à Continue de te montrer le payload XHTML avant l'appel.
+- Si ta Confluence est en réalité on-premise (`*.echonet`), bascule sur `mcp-atlassian` de sooperset avec un PAT ; la config Continue change un peu (variables d'env `CONFLUENCE_URL`, `CONFLUENCE_PERSONAL_TOKEN`).
+
+Tu veux que je te génère le fichier `pipeline_spec.md` d'exemple (la "source brute" que l'agent transformera en page Confluence) pour la démo ?
+
 Bien reçu, j'ai analysé les 12 images. Voici la synthèse.
 
 ## Synthèse — Agentic Data Pipeline Generator (CTDF AiDPGen)
