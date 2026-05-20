@@ -1,3 +1,182 @@
+Le problème vient d'une confusion classique sur où vivent les MCP. Les MCP de Continue ne sont **pas** accessibles via son API : ils s'exécutent dans le process Continue côté client, pas dans le LLM derrière. Quand opencode appelle l'API Continue, il récupère juste les complétions du modèle — sans tool use, sans MCP.
+
+## Pourquoi ça ne marche pas
+
+```
+opencode  ──HTTP──►  Continue API  ──►  Anthropic/OpenAI
+   │                     │
+   │                     └── MCP servers (Confluence, JIRA)  ← attachés ici, pas exposés
+   │
+   └── ses propres MCP (vide)
+```
+
+Les MCP que tu as configurés dans `~/.continue/config.yaml` sont chargés par l'extension VS Code Continue et utilisés **uniquement quand tu chattes dans Continue**. L'API Continue (si elle est utilisée comme proxy LLM) ne relaie pas ces tools à opencode. C'est pour ça qu'opencode te dit qu'il n'a pas de MCP — de son point de vue, c'est vrai.
+
+## La solution : configurer les MCP dans opencode directement
+
+opencode a son propre système de MCP, à déclarer dans sa config (`~/.config/opencode/opencode.json` ou `opencode.json` à la racine du projet).
+
+Exemple minimal pour Atlassian Remote MCP (Cloud) :
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "atlassian": {
+      "type": "local",
+      "command": ["npx", "-y", "mcp-remote", "https://mcp.atlassian.com/v1/sse"],
+      "enabled": true
+    }
+  }
+}
+```
+
+Au premier lancement, `mcp-remote` ouvrira une fenêtre navigateur pour l'OAuth Atlassian. Une fois fait, opencode verra les tools Confluence + JIRA.
+
+## Si ta Confluence est on-premise (echonet)
+
+Pas de Remote MCP officiel possible. Utilise `mcp-atlassian` de sooperset avec un PAT :
+
+```json
+{
+  "mcp": {
+    "atlassian": {
+      "type": "local",
+      "command": [
+        "docker", "run", "-i", "--rm",
+        "-e", "CONFLUENCE_URL",
+        "-e", "CONFLUENCE_PERSONAL_TOKEN",
+        "-e", "JIRA_URL",
+        "-e", "JIRA_PERSONAL_TOKEN",
+        "ghcr.io/sooperset/mcp-atlassian:latest"
+      ],
+      "environment": {
+        "CONFLUENCE_URL": "https://confluence.group.echonet",
+        "CONFLUENCE_PERSONAL_TOKEN": "<ton-PAT>",
+        "JIRA_URL": "https://jira.group.echonet",
+        "JIRA_PERSONAL_TOKEN": "<ton-PAT>"
+      },
+      "enabled": true
+    }
+  }
+}
+```
+
+## Vérifier que ça marche
+
+Dans opencode, après config :
+
+```
+List your available tools.
+```
+
+Tu dois voir apparaître des tools du type `mcp__atlassian__*` (createPage, getIssue, etc.). Si oui, tu peux relancer ton prompt Confluence/JIRA.
+
+## À retenir
+
+Règle générale : **les MCP doivent être configurés dans le client qui pilote la conversation** (opencode dans ton cas), pas dans un autre client qu'on utilise comme proxy LLM. Continue et opencode sont deux clients MCP indépendants ; ils ne partagent pas leurs tools.
+
+Tu veux que je vérifie la syntaxe exacte de la config opencode pour ta version, ou tu as accès à la doc en local ?
+
+
+## Confluence → HTML
+
+```
+Using the Atlassian MCP, fetch Confluence page <PAGE_ID> with body in storage format. Save the raw XHTML body to `confluence_<PAGE_ID>.html` (wrap it in <html><body>...</body></html>, keep all <ac:...> macros intact). Print the file path and page title.
+```
+
+## JIRA → JSON
+
+```
+Using the Atlassian MCP, fetch JIRA issue <ISSUE_KEY> with comments and changelog. Save it as pretty-printed JSON to `jira_<ISSUE_KEY>.json` including: key, summary, description, status, type, priority, assignee, reporter, created, updated, labels, comments, and issuelinks. Print the file path and status.
+```
+
+Remplace `<PAGE_ID>` et `<ISSUE_KEY>`.
+
+
+Voici les deux prompts à utiliser dans Continue.
+
+## Prompt 1 — Dump d'une page Confluence en HTML
+
+```
+Use the Atlassian MCP server to fetch the full content of an existing Confluence page and save it locally.
+
+Target page:
+- Page ID: <PAGE_ID>
+  (or, if you only have the URL: <CONFLUENCE_PAGE_URL> — extract the pageId query param)
+
+Steps:
+1. Call the Confluence "get page" tool with the page ID, requesting the body in "storage" format (XHTML). Also include version, space, and ancestors in the expand parameters if supported.
+2. From the response, extract:
+   - id, title, spaceKey, version.number, lastUpdated, author
+   - body.storage.value (the XHTML content)
+3. Write the result to a local file named `confluence_<PAGE_ID>.html` in the current workspace using the following structure:
+
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title><!-- page title --></title>
+  <!-- Metadata as HTML comments: id, spaceKey, version, lastUpdated, author, sourceUrl -->
+</head>
+<body>
+  <!-- Raw Confluence storage-format XHTML body goes here, untouched -->
+</body>
+</html>
+
+4. Do NOT clean, reformat, or strip the <ac:...> / <ri:...> macros — keep the storage format intact so the file is a faithful dump.
+5. After writing the file, print: the file path, the page title, and the byte size of the body.
+```
+
+## Prompt 2 — Dump d'un ticket JIRA en JSON
+
+```
+Use the Atlassian MCP server to fetch an existing JIRA issue and save it locally as JSON.
+
+Target issue:
+- Issue key: <ISSUE_KEY>   (e.g. "AER-123")
+
+Steps:
+1. Call the JIRA "get issue" tool for <ISSUE_KEY>. Request all standard fields plus comments, attachments, issuelinks, subtasks, worklog, and changelog if available (use expand=renderedFields,names,schema,changelog if supported).
+2. Build a clean JSON object with this shape:
+
+{
+  "key": "...",
+  "id": "...",
+  "url": "...",
+  "summary": "...",
+  "description": "...",            // plain text or ADF, whichever the API returns
+  "status": "...",
+  "issueType": "...",
+  "priority": "...",
+  "labels": [...],
+  "components": [...],
+  "fixVersions": [...],
+  "assignee": { "displayName": "...", "accountId": "..." },
+  "reporter": { "displayName": "...", "accountId": "..." },
+  "created": "...",
+  "updated": "...",
+  "resolution": "...",
+  "parent": { "key": "...", "summary": "..." },
+  "subtasks": [ { "key": "...", "summary": "...", "status": "..." } ],
+  "issuelinks": [ { "type": "...", "direction": "inward|outward", "key": "...", "summary": "..." } ],
+  "comments": [
+    { "author": "...", "created": "...", "body": "..." }
+  ],
+  "attachments": [ { "filename": "...", "size": ..., "url": "..." } ],
+  "customFields": { /* any non-null custom fields, keyed by their human-readable name when available */ },
+  "changelog": [ { "created": "...", "author": "...", "items": [...] } ]
+}
+
+3. Write the result to a local file named `jira_<ISSUE_KEY>.json` in the current workspace, pretty-printed with 2-space indentation and UTF-8 encoding.
+4. After writing the file, print: the file path, the issue key, the summary, the current status, and the number of comments.
+
+If any field is missing or null in the API response, omit it from the JSON rather than writing null.
+```
+
+Remplace `<PAGE_ID>` (ou `<CONFLUENCE_PAGE_URL>`) et `<ISSUE_KEY>` avant de lancer. Si Continue ne parvient pas à écrire le fichier directement, demande-lui simplement d'afficher le contenu et tu fais un copier-coller — mais avec l'outil d'édition de fichiers activé dans Continue, ça doit passer tout seul.
+
+
 ```
 You have access to the Atlassian MCP server. Use the Confluence tools to create a new page.
 
