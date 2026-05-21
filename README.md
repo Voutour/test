@@ -1,3 +1,100 @@
+Excellent, ça change **tout** le diagnostic. Maintenant on a la vraie image et c'est beaucoup plus simple que je le pensais.
+
+## Ce qui est en train de se passer
+
+BNP a déployé un **MCP gateway corporate interne** à l'URL `https://devops-itg.mcp.cib.echonet/`. Ce gateway expose Confluence, JIRA, GitLab, SonarQube, ServiceNow, Jenkins, etc. en un seul endpoint MCP. Il s'authentifie via des **headers HTTP custom** (`user-id`, `confluence-token`, `jira-token`, etc.) — pas via Bearer, pas via Basic Auth.
+
+Donc :
+- **Aucun SSO à contourner** (le gateway est fait pour ça)
+- **Aucun Docker / npx / Python local à installer**
+- **Aucun PAT généré depuis Confluence** — les tokens sont des tokens corporate dédiés au gateway
+
+C'est exactement ce que je supposais comme "Option 3" plus haut : tu as un proxy MCP corporate déjà prêt. On efface tout ce qu'on a fait avant.
+
+## La traduction Continue → opencode
+
+Le format du yaml Continue est :
+
+```yaml
+mcpServers:
+  - name: DevopsProdITG
+    type: streamable-http
+    url: https://devops-itg.mcp.cib.echonet/
+    requestOptions:
+      headers:
+        user-id: "j17990"
+        confluence-token: "Njq40Tg2..."
+        jira-token: "MTMyMzgz..."
+        gitlab-token: "glpat-..."
+```
+
+Pour opencode, ça devient :
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "myprovider": {
+      "options": {
+        "baseURL": "https://ai4devs.group.echonet/api/v1",
+        "apiKey": "YOUR_TOKEN_TO_BE_COPIED_FROM_THIS_PATH_/home/coder/.continue/.env"
+      },
+      "models": {
+        "devstral-small-2512": {
+          "name": "devstral-small-2512",
+          "limit": { "context": 262144, "output": 65536 }
+        },
+        "gpt-oss-120b": {
+          "name": "gpt-oss-120b",
+          "limit": { "context": 128000, "output": 65536 }
+        }
+      }
+    }
+  },
+  "mcp": {
+    "DevopsProdITG": {
+      "type": "remote",
+      "url": "https://devops-itg.mcp.cib.echonet/",
+      "headers": {
+        "user-id": "j17990",
+        "confluence-token": "Njq40Tg2NDQ4NjE1Oj3yl5Z/Y/O3/ZeZ6bArdn7ggJjO",
+        "jira-token": "MTMyMzgzMzc3NDU3OuwiXgak94ZUoRt5iVB1OLZsVGX/",
+        "gitlab-token": "glpat-KXyizHgrb_wueurjEbfN",
+        "sonarqube-token": "your token",
+        "snow-consumer-secret": "your token",
+        "snow-consumer-key": "your token",
+        "snow-incident-secret": "your token",
+        "snow-incident-key": "your token",
+        "jenkins-token": "your token"
+      },
+      "enabled": true
+    }
+  }
+}
+```
+
+## Points clés
+
+- Type `remote` (pas `local`) puisque le gateway est déjà hébergé
+- L'**URL identique** au yaml Continue (`https://devops-itg.mcp.cib.echonet/`)
+- Les **headers identiques** au yaml Continue — c'est ça qu'opencode attendait sous une syntaxe différente
+- Tu peux ne mettre que `confluence-token` et `jira-token` si tu n'as pas besoin du reste pour ton POC, ça fonctionnera quand même
+
+## Action
+
+1. Crée/ouvre `~/.config/opencode/opencode.json` (ou `opencode.json` à la racine de ton projet)
+2. Colle la config ci-dessus en remplaçant tes tokens (les vrais, copiés depuis ton yaml Continue)
+3. Relance opencode et tape `opencode mcp list` — tu devrais voir `DevopsProdITG` connecté
+4. Teste : `Use the DevopsProdITG MCP to fetch Confluence page 945346895 and print its title`
+
+## Pour répondre à ta question d'avant
+
+Ce n'est pas Continue qui faisait quelque chose de magique. C'est que **tu pointais déjà sur un gateway MCP interne** qui gère tout pour toi (auth, SSO bypass, routage vers Confluence/JIRA). Quand tu disais que c'était "simple" avec Continue, c'était parce que la complexité avait été absorbée par l'équipe DevOps ITG en amont. Bonne nouvelle : opencode peut taper sur exactement le même gateway, il fallait juste connaître son existence.
+
+Petit conseil de sécurité au passage : tes tokens sont visibles dans la photo. Si la photo a été partagée ailleurs, regénère-les depuis le portail interne.
+
+
+
 Confirmé : **c'est le SSO qui intercepte ta requête**. Ton PAT n'est même pas évalué par Confluence, le proxy SSO te redirige avant.
 
 ## Ce qui se passe
