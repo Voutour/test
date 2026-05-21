@@ -1,3 +1,109 @@
+Bonne nouvelle : ta config est lue (`opencode mcp list` montre bien le serveur `atlassian`). Mauvaise nouvelle : le container ne démarre pas, d'où le `Connection closed`.
+
+Tu es sur `coder@cloudide-j17990` — c'est un **DevX cloud IDE** (Coder). Dans ce type d'environnement, Docker n'est généralement pas dispo (pas de Docker-in-Docker), donc le `docker run` échoue silencieusement et le MCP se ferme aussitôt.
+
+## Diagnostic en 30 secondes
+
+Lance ces deux commandes dans le terminal :
+
+```bash
+docker --version
+docker ps
+```
+
+Trois cas possibles :
+
+**Cas A** — `command not found` → pas de Docker dans DevX → il faut passer à la variante **uvx** (ci-dessous).
+
+**Cas B** — Docker présent mais `permission denied` ou `Cannot connect to the Docker daemon` → pareil, passe à la variante uvx.
+
+**Cas C** — Docker fonctionne → l'image n'a juste pas pu être pull (réseau bloqué vers `ghcr.io` ?). Teste : `docker pull ghcr.io/sooperset/mcp-atlassian:latest`. Si ça échoue, même solution : uvx.
+
+## Solution : variante sans Docker (avec uvx)
+
+`mcp-atlassian` est un package Python, installable directement via `uvx` (le runner d'`uv`, déjà courant dans les environnements DevX modernes). Vérifie d'abord :
+
+```bash
+uvx --version
+```
+
+Si présent, remplace ta config par ça :
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "atlassian": {
+      "type": "local",
+      "command": [
+        "uvx",
+        "mcp-atlassian"
+      ],
+      "environment": {
+        "CONFLUENCE_URL": "https://confluence.group.echonet",
+        "CONFLUENCE_PERSONAL_TOKEN": "TON_PAT_ICI",
+        "JIRA_URL": "https://jira.group.echonet",
+        "JIRA_PERSONAL_TOKEN": "TON_PAT_ICI"
+      },
+      "enabled": true
+    }
+  }
+}
+```
+
+Différences avec ta version Docker :
+- Plus de `docker run` ni de `-e` répétés
+- Les variables d'env vont **uniquement** dans le bloc `environment` d'opencode, qui les injecte dans le process enfant
+- Premier lancement = uvx télécharge le package (quelques secondes), puis met en cache
+
+## Si uvx n'est pas dispo non plus
+
+Variante avec pipx ou pip direct :
+
+```bash
+pip install --user mcp-atlassian
+# ou
+pipx install mcp-atlassian
+```
+
+Puis dans opencode.json :
+
+```json
+"command": ["mcp-atlassian"]
+```
+
+(en s'assurant que `~/.local/bin` est dans le PATH du shell que lance opencode)
+
+## Re-tester
+
+```bash
+opencode mcp list
+```
+
+Tu devrais voir `✓ atlassian connected` au lieu de `✗ failed`.
+
+## Vérifier les tokens en parallèle
+
+Pendant que tu débugges, fais un test "à la main" pour valider que tes PAT marchent, indépendamment du MCP :
+
+```bash
+curl -H "Authorization: Bearer TON_PAT" \
+     https://confluence.group.echonet/rest/api/space
+```
+
+Si tu reçois un JSON avec des espaces, le PAT est OK. Si tu reçois `401 Unauthorized`, le problème est sur le token (régénère-le), pas sur opencode.
+
+---
+
+**Plan d'action** dans l'ordre :
+
+1. `docker --version` → me dire le résultat
+2. `uvx --version` → me dire le résultat
+3. `curl` de validation du PAT → me dire si ça répond 200 ou 401
+
+Dis-moi ce qui sort et on règle ça en une itération.
+
+
 Le problème vient d'une confusion classique sur où vivent les MCP. Les MCP de Continue ne sont **pas** accessibles via son API : ils s'exécutent dans le process Continue côté client, pas dans le LLM derrière. Quand opencode appelle l'API Continue, il récupère juste les complétions du modèle — sans tool use, sans MCP.
 
 ## Pourquoi ça ne marche pas
