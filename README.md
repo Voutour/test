@@ -1,3 +1,80 @@
+Parfait, Python 3 dispo + erreur "auth required" = on a tout pour basculer sur la bonne solution. Le serveur `@aashari` essaie un Basic Auth qui ne passe pas sur ton Data Center → on le remplace par `mcp-atlassian` (Python) qui supporte nativement le Bearer PAT.
+
+## Étape 1 — Installer mcp-atlassian
+
+Dans un terminal :
+
+```bash
+pip install --user mcp-atlassian
+```
+
+Puis vérifie que ça tourne :
+
+```bash
+python -m mcp_atlassian --help
+```
+
+(si `python` ne marche pas, essaie `python3` partout)
+
+Tu dois voir l'aide du serveur s'afficher. Si oui, tu es bon.
+
+## Étape 2 — Remplacer ta config opencode
+
+Remplace **complètement** ton bloc `mcp` actuel par celui-ci :
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "atlassian": {
+      "type": "local",
+      "command": ["python", "-m", "mcp_atlassian"],
+      "environment": {
+        "CONFLUENCE_URL": "https://confluence.group.echonet",
+        "CONFLUENCE_PERSONAL_TOKEN": "<ton-PAT>",
+        "JIRA_URL": "https://jira.group.echonet",
+        "JIRA_PERSONAL_TOKEN": "<ton-PAT>"
+      },
+      "enabled": true
+    }
+  }
+}
+```
+
+Trois points importants :
+
+- Si `python -m mcp_atlassian` ne marche pas, mets `"python3"` au lieu de `"python"` dans le tableau `command`
+- **Un seul serveur "atlassian"** qui gère Confluence + JIRA (au lieu de deux serveurs séparés comme avec @aashari)
+- Le même PAT pour les deux si SSO unifié, sinon deux PAT différents
+
+## Étape 3 — Tester
+
+Relance opencode, puis :
+
+```
+opencode mcp list
+```
+
+Tu dois voir `atlassian` connecté. Puis dans une session opencode :
+
+```
+List the Confluence spaces I can access.
+```
+
+Si tu vois des espaces revenir → c'est bon, l'auth passe. Tu peux ensuite passer aux prompts get-page et get-issue.
+
+## Si pip install échoue
+
+Réseau corporate qui bloque PyPI ? Tente avec le proxy interne BNP (souvent `nexus.echonet` ou similaire) :
+
+```bash
+pip install --user --index-url https://<proxy-interne>/repository/pypi-proxy/simple mcp-atlassian
+```
+
+Demande à DevX/AIDI08 l'URL exacte du mirror PyPI interne s'il existe.
+
+Tente l'installation et dis-moi ce que ça donne.
+
 OK, contrainte forte mais contournable. Trois options par ordre de préférence.
 
 ## Option 1 — npx (le plus simple, si Node est dispo)
