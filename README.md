@@ -1,3 +1,112 @@
+Confirmé : **c'est le SSO qui intercepte ta requête**. Ton PAT n'est même pas évalué par Confluence, le proxy SSO te redirige avant.
+
+## Ce qui se passe
+
+```
+ton curl  ──Bearer PAT──►  Proxy SSO (echonet)
+                                │
+                                ▼
+                          302 → login SSO
+```
+
+Le proxy ne reconnaît pas le Bearer header comme authentification valide. Il attend un cookie de session SSO, qu'il n'a pas, donc il redirige. Confluence derrière ne voit jamais ta requête.
+
+## Comment confirmer et débloquer
+
+### Étape 1 — Regarde où il te redirige
+
+```bash
+curl -i -H "Authorization: Bearer <ton-PAT>" \
+  "https://confluence.group.echonet/rest/api/user/current" 2>&1 | grep -i "location:"
+```
+
+Le header `Location:` te dit qui intercepte. Trois cas typiques en banque :
+- `https://sso.bnpparibas.com/...` ou `idp.group.echonet` → SAML/OIDC corporate
+- `https://confluence.group.echonet/login.action?...` → form de login natif Confluence (le PAT n'est pas reconnu, possiblement Confluence trop ancien)
+- Une URL ADFS/Ping/Okta → un IdP standard
+
+### Étape 2 — Vérifier que les PAT sont activés sur ton Confluence
+
+Sur certaines instances Data Center, les Personal Access Tokens doivent être **activés explicitement** par l'admin, et **whitelistés au niveau du proxy SSO** pour bypasser l'auth. Si l'admin n'a pas fait ça, ton PAT est valide côté Confluence mais inutilisable depuis l'extérieur du SSO.
+
+Endroit où vérifier : ton URL de génération de PAT. Si la page existe et te laisse créer des tokens, le feature est activé côté Confluence. Mais ça ne dit rien sur la config du proxy.
+
+### Étape 3 — Tester avec un endpoint connu pour bypass SSO
+
+Certains proxys SSO BNP laissent passer les requêtes avec un header spécifique, ou sur un sous-chemin différent. Quelques tests à tenter :
+
+```bash
+# Variante 1 : header X-Atlassian-Token
+curl -i -H "Authorization: Bearer <ton-PAT>" \
+       -H "X-Atlassian-Token: no-check" \
+       "https://confluence.group.echonet/rest/api/user/current"
+
+# Variante 2 : sous-domaine API dédié (très courant en corporate)
+curl -i -H "Authorization: Bearer <ton-PAT>" \
+       "https://confluence-api.group.echonet/rest/api/user/current"
+
+# Variante 3 : header User-Agent non-navigateur (parfois le proxy ne SSO que les navigateurs)
+curl -i -H "Authorization: Bearer <ton-PAT>" \
+       -H "User-Agent: curl/7.0" \
+       "https://confluence.group.echonet/rest/api/user/current"
+```
+
+Si une de ces variantes te renvoie 200 + JSON, on a la solution et il suffira de la reporter dans la config MCP.
+
+## La vraie réponse : demander à l'équipe Confluence interne
+
+À ce stade, c'est un blocage **infra/sécurité**, pas un blocage technique de ton côté. Le PAT seul ne suffira **pas** tant que le proxy SSO l'intercepte. Tu dois poser la question à l'équipe Confluence/SSO BNP. Voici le mail / ticket type à envoyer :
+
+```
+Objet : Accès API Confluence via Personal Access Token
+
+Bonjour,
+
+Dans le cadre du projet Agentic Data Pipeline Generator (CTDF), 
+je dois accéder à l'API REST de Confluence (et JIRA) en non-interactif, 
+via un Personal Access Token, depuis un outil local (MCP server).
+
+J'ai généré un PAT depuis mon profil Confluence. Il fonctionne 
+côté Confluence, mais toutes mes requêtes vers 
+https://confluence.group.echonet/rest/api/... sont redirigées 
+en 302 vers le SSO, qui ne reconnaît pas le header Bearer.
+
+Questions :
+1. Existe-t-il un endpoint API qui bypasse le SSO pour les PAT 
+   (sous-domaine dédié, header spécifique) ?
+2. Le PAT doit-il être whitelisté côté proxy SSO pour fonctionner ?
+3. Quelle est la procédure standard pour automatiser des appels 
+   API Confluence/JIRA en interne ?
+
+Merci d'avance.
+```
+
+À envoyer à l'équipe **Confluence/Atlassian admin** BNP (souvent rattachée à ITG-A ou à une squad "Collaboration Tools"). L'équipe DevX mentionnée dans tes screenshots saura te rediriger.
+
+## En attendant : plan B pour ton POC
+
+Pour ne pas être bloqué sur la démo, tu as deux contournements possibles :
+
+**Plan B1 — Cookie de session.** Ouvre Confluence dans ton navigateur, connecte-toi normalement, ouvre les DevTools (F12) → Application → Cookies → copie le cookie de session (`JSESSIONID` ou équivalent SSO). Teste :
+
+```bash
+curl -i -H "Cookie: JSESSIONID=<valeur>" \
+  "https://confluence.group.echonet/rest/api/user/current"
+```
+
+Si ça passe en 200, tu as une auth temporaire (le cookie expire en quelques heures). Pas viable pour la prod, mais pour démontrer le POC ça suffit. Tu peux injecter ce cookie via les headers dans le MCP server (au lieu du Bearer).
+
+**Plan B2 — Bouchon local.** Pour la démo, monte une fausse page Confluence en local (un petit serveur Python qui sert du JSON imitant l'API Confluence). Tu démontres l'agent fonctionnel sans dépendre du SSO. Moins glamour mais débloque la présentation.
+
+## Action immédiate
+
+Fais les 3 variantes de curl ci-dessus (étape 3) et regarde le `Location:` de la 302 initiale. Dis-moi :
+1. Vers quelle URL le SSO te redirige
+2. Si une des 3 variantes renvoie autre chose qu'un 302
+
+Avec ça on saura si c'est contournable techniquement ou si tu dois passer par l'équipe Atlassian BNP.
+
+
 Parfait, Python 3 dispo + erreur "auth required" = on a tout pour basculer sur la bonne solution. Le serveur `@aashari` essaie un Basic Auth qui ne passe pas sur ton Data Center → on le remplace par `mcp-atlassian` (Python) qui supporte nativement le Bearer PAT.
 
 ## Étape 1 — Installer mcp-atlassian
