@@ -1,3 +1,102 @@
+OK, contrainte forte mais contournable. Trois options par ordre de préférence.
+
+## Option 1 — npx (le plus simple, si Node est dispo)
+
+Vérifie dans un terminal :
+
+```bash
+node --version
+npx --version
+```
+
+Si tu as Node, tu peux utiliser un MCP server Atlassian basé npm. Il en existe plusieurs ; le plus actif aujourd'hui est `@aashari/mcp-server-atlassian-confluence` et son équivalent JIRA :
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "confluence": {
+      "type": "local",
+      "command": ["npx", "-y", "@aashari/mcp-server-atlassian-confluence"],
+      "environment": {
+        "ATLASSIAN_SITE_NAME": "confluence.group.echonet",
+        "ATLASSIAN_USER_EMAIL": "<ton.email@bnpparibas.com>",
+        "ATLASSIAN_API_TOKEN": "<ton-PAT>"
+      },
+      "enabled": true
+    },
+    "jira": {
+      "type": "local",
+      "command": ["npx", "-y", "@aashari/mcp-server-atlassian-jira"],
+      "environment": {
+        "ATLASSIAN_SITE_NAME": "jira.group.echonet",
+        "ATLASSIAN_USER_EMAIL": "<ton.email@bnpparibas.com>",
+        "ATLASSIAN_API_TOKEN": "<ton-PAT>"
+      },
+      "enabled": true
+    }
+  }
+}
+```
+
+**Attention** : ces serveurs npm sont surtout testés contre Atlassian Cloud. Sur du Confluence Data Center, ça **peut** marcher (les endpoints REST sont proches) mais ce n'est pas garanti. À tester.
+
+## Option 2 — Python sans uv (`pip install --user`)
+
+Si tu as Python mais pas uv :
+
+```bash
+pip install --user mcp-atlassian
+```
+
+(le `--user` installe dans ton home, pas besoin d'admin)
+
+Puis trouve où c'est installé :
+
+```bash
+python -m mcp_atlassian --help
+```
+
+Et la config :
+
+```json
+{
+  "mcp": {
+    "atlassian": {
+      "type": "local",
+      "command": ["python", "-m", "mcp_atlassian"],
+      "environment": {
+        "CONFLUENCE_URL": "https://confluence.group.echonet",
+        "CONFLUENCE_PERSONAL_TOKEN": "<ton-PAT>",
+        "JIRA_URL": "https://jira.group.echonet",
+        "JIRA_PERSONAL_TOKEN": "<ton-PAT>"
+      },
+      "enabled": true
+    }
+  }
+}
+```
+
+`mcp-atlassian` (sooperset) supporte explicitement Data Center / on-prem avec PAT — c'est l'option la plus fiable pour ton instance echonet **si tu peux installer Python ou si tu l'as déjà**.
+
+## Option 3 — Demander un proxy MCP corporate
+
+Dans une banque comme BNP, il y a souvent une équipe plateforme qui prépare des connecteurs MCP standards (Confluence/JIRA inclus) déjà hébergés sur un endpoint interne. Avant de t'embêter, pose la question :
+
+- À l'équipe **DevX** (ils sont mentionnés dans la doc CTDF)
+- À l'équipe **AIDI08** (vu dans le breadcrumb GitLab de ta capture)
+
+S'il existe un MCP server interne déjà déployé, tu n'as qu'à mettre `"type": "remote"` avec l'URL et le token internes — c'est la solution propre.
+
+## Ordre que je te conseille
+
+1. **Tester `node --version` et `python --version`** dans ton terminal — dis-moi ce que ça donne
+2. Si Node → Option 1 (npx, 30 secondes à mettre en place)
+3. Si Python → Option 2 (pip install --user)
+4. En parallèle, demande à DevX/AIDI08 s'il y a déjà un MCP corporate
+
+Dis-moi ce que tu as côté Node/Python et je t'oriente sur la bonne config.
+
 Bonne nouvelle : ta config est lue (`opencode mcp list` montre bien le serveur `atlassian`). Mauvaise nouvelle : le container ne démarre pas, d'où le `Connection closed`.
 
 Tu es sur `coder@cloudide-j17990` — c'est un **DevX cloud IDE** (Coder). Dans ce type d'environnement, Docker n'est généralement pas dispo (pas de Docker-in-Docker), donc le `docker run` échoue silencieusement et le MCP se ferme aussitôt.
